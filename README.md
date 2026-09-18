@@ -157,3 +157,6 @@ See [NOTICE.md](NOTICE.md) for full attribution.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Bundled third-party code, its copyright holders and its license texts are listed
+in [NOTICE.md](NOTICE.md). Everything bundled is MIT-licensed.
