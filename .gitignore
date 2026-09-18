@@ -1,0 +1,29 @@
+# Our own working notes, probes, diagnostics and captured logs. Deliberately
+# not published: they are handover documents and speculation, not documentation.
+workdocs/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Downloaded language servers (Roslyn, tsserver, …) and their caches — large,
+# regenerable, machine-specific.
+.solidlsp/
+
+# The Portainer MCP server writes its tool manifest into whatever directory it
+# starts in. Not ours; it reappears after every delete.
+tools.yaml
+
+# Editor/OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Generated indexes and logs — regenerable, multi-MB, not part of the tool.
+out/
+*.log

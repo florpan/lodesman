@@ -1,0 +1,9 @@
+# Normalise to LF in the repository. This matters most for the vendored
+# SolidLSP tree: if Git rewrote its line endings, every re-sync against
+# upstream would diff on whitespace instead of on real changes.
+* text=auto eol=lf
+
+# Binary-ish assets that must never be touched.
+*.png binary
+*.gz binary
+*.zip binary

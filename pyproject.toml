@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lodesman-mcp"
+version = "0.3.0"
+description = "Compiler-grade code intelligence over MCP — a language server's own answers, as agent tools"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.md", "src/lodesman/_vendor/solidlsp/LICENSE"]
+authors = [{ name = "Christer Åkerlund" }]
+keywords = ["mcp", "lsp", "language-server", "code-intelligence", "agent", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Transitive dependencies of the vendored SolidLSP tree, which cannot declare
+# its own since it is not a separate distribution. Lower bounds are the
+# versions Lodesman has actually been run against, not guesses.
+dependencies = [
+    "pygls>=2.1.1",
+    "lsprotocol>=2025.0.0",
+    "psutil>=7.0",
+    "pathspec>=1.1",
+    "overrides>=7.7",
+    "sensai-utils>=1.6",
+    "filelock>=3.16",
+    "oslex>=2.0",
+    "requests>=2.32",
+    "charset-normalizer>=3.4",
+    "typing-extensions>=4.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/florpan/lodesman"
+Source = "https://github.com/florpan/lodesman"
+Issues = "https://github.com/florpan/lodesman/issues"
+
+[project.scripts]
+lodesman-mcp = "lodesman.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lodesman"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/lodesman", "scripts", "README.md", "LICENSE", "NOTICE.md", "pyproject.toml"]
+
+# The vendored tree ships whole: its language-server manifests and the Solidity
+# preload script are data files the code reads at runtime, not dead weight.
+[tool.hatch.build]
+artifacts = [
+    "src/lodesman/_vendor/solidlsp/**/*.json",
+    "src/lodesman/_vendor/solidlsp/**/*.cjs",
+]
