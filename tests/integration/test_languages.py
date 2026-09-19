@@ -67,7 +67,7 @@ class LanguageContract:
 
         tmp = tempfile.TemporaryDirectory(prefix=f"lodesman-{cls.spec.language}-")
         cls.addClassCleanup(tmp.cleanup)
-        cls.repo = cls.spec.build(Path(tmp.name) / "repo")
+        cls.repo = cls.spec.build(Path(tmp.name).resolve() / "repo")
 
         cls.server = Server(cls.repo, language=cls.spec.language)
         cls.addClassCleanup(cls.server.close)
@@ -82,7 +82,7 @@ class LanguageContract:
         """A private repository and server, for a test that writes."""
         tmp = tempfile.TemporaryDirectory(prefix=f"lodesman-{self.spec.language}-rw-")
         self.addCleanup(tmp.cleanup)
-        repo = self.spec.build(Path(tmp.name) / "repo")
+        repo = self.spec.build(Path(tmp.name).resolve() / "repo")
         server = Server(repo, language=self.spec.language)
         self.addCleanup(server.close)
         server.initialize()

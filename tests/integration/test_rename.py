@@ -49,7 +49,7 @@ class RenameCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="lodesman-rename-")
         self.addCleanup(self._tmp.cleanup)
 
-        root = Path(self._tmp.name)
+        root = Path(self._tmp.name).resolve()  # see test_startup: 8.3 short paths
         builders = {
             "py_lf": lambda: fixtures.python_repo(root / "r"),
             "py_crlf": lambda: fixtures.python_repo(root / "r", newline="\r\n"),

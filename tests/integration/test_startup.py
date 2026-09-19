@@ -37,7 +37,11 @@ class IntegrationCase(unittest.TestCase):
         # cleanup with the resource covers every exit.
         cls._tmp = tempfile.TemporaryDirectory(prefix="lodesman-it-")
         cls.addClassCleanup(cls._tmp.cleanup)
-        cls.repos = fixtures.build_all(Path(cls._tmp.name))
+        # resolve(): on Windows, TMP can be an 8.3 short path — the GitHub
+        # runner's is C:\Users\RUNNER~1\... — and lodesman resolves the root it
+        # is given, so an unresolved fixture path never matches what the server
+        # reports back. Canonicalise here rather than at each comparison.
+        cls.repos = fixtures.build_all(Path(cls._tmp.name).resolve())
 
     def stderr_line(self, server: Server, needle: str, timeout: float = 30) -> str:
         deadline = time.time() + timeout
