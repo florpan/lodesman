@@ -141,6 +141,33 @@ The language is detected by counting source files under the root and taking the
 majority. Auto-detected: **C#, TypeScript/JavaScript, Python, Go, Rust, Java,
 Kotlin, Ruby, PHP, Swift, C/C++**.
 
+### React, Vue, Svelte, Angular
+
+React is not a separate thing to configure. `.tsx` and `.jsx` are TypeScript and
+JavaScript with JSX syntax, and the TypeScript server handles them natively
+alongside `.ts`, `.js`, `.mts`, `.mjs` and the rest — twelve extensions in total.
+One server covers a mixed React codebase, and references resolve across the
+boundary: a function declared in `api.ts` and used from both a `.tsx` and a
+`.jsx` component comes back as one answer with all of them.
+
+```bash
+lodesman-mcp frontend --language typescript   # React, plain TS, or both
+```
+
+Vue and Svelte are genuinely different, because `.vue` and `.svelte` are
+single-file-component formats that are not valid TypeScript. They have their own
+servers — and those servers are **supersets**, not alternatives: the Vue server
+handles `.vue` *and* `.ts`/`.js`, Svelte handles `.svelte` *and* `.ts`, Angular
+handles `.ts`/`.tsx` *and* `.html`. So there is still one server for the
+frontend, just a different one:
+
+```bash
+lodesman-mcp frontend --language vue          # .vue and .ts together
+```
+
+Those three are not auto-detected yet and are untested here, so they need naming
+explicitly. See below.
+
 ### A language it does not auto-detect
 
 SolidLSP ships servers for far more languages than the eleven above. Any of them

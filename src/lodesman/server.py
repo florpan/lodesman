@@ -46,22 +46,45 @@ SERVER_VERSION = "0.3.1"
 WARM_PROBE = "a"
 
 # Extension -> language server id, for auto-detection.
-EXTENSION_LANGUAGES = {
-    ".cs": "csharp",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".js": "typescript",
-    ".py": "python",
-    ".go": "go",
-    ".rs": "rust",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".cpp": "cpp",
-    ".c": "cpp",
-}
+# The languages detection knows about. Every one has a fixture in
+# tests/integration/languages.py, and a test fails if that stops being true.
+DETECTED_LANGUAGES = (
+    LanguageServerId.CSHARP,
+    LanguageServerId.TYPESCRIPT,
+    LanguageServerId.PYTHON,
+    LanguageServerId.GO,
+    LanguageServerId.RUST,
+    LanguageServerId.JAVA,
+    LanguageServerId.KOTLIN,
+    LanguageServerId.RUBY,
+    LanguageServerId.PHP,
+    LanguageServerId.SWIFT,
+    LanguageServerId.CPP,
+)
+
+
+def _extension_languages() -> dict[str, str]:
+    """
+    Extension -> language, taken from each server's own idea of what it handles.
+
+    Hand-listing these was wrong in a way that only shows up on real projects.
+    The list here used to be .ts, .tsx and .js, while tsserver actually handles
+    twelve extensions — so a React codebase written in .jsx, or anything modern
+    using .mts or .mjs, contained no "recognized source files" at all and the
+    server exited rather than starting. Deriving the map means a language server
+    that learns a new extension is picked up without anyone remembering to.
+    """
+    mapping: dict[str, str] = {}
+    for language_id in DETECTED_LANGUAGES:
+        for extension in language_id.get_source_fn_matcher().file_extensions:
+            # First declaration wins, so the order above is the tie-break. There
+            # are no overlaps today; this only decides what happens if upstream
+            # introduces one.
+            mapping.setdefault(extension, language_id.value)
+    return mapping
+
+
+EXTENSION_LANGUAGES = _extension_languages()
 
 SKIP_DIRS = {
     "obj", "bin", "node_modules", "dist", "build",
