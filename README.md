@@ -195,6 +195,50 @@ through `uvx`, which brings its own runtime, so the Python tests run on any
 machine with uv even without node — only the TypeScript ones need node. Good
 for coverage, but the two conditions are not the same claim.
 
+### The language contract
+
+`tests/integration/languages.py` holds one fixture project per language
+lodesman auto-detects, all modelling the same thing — a `Record` type, a `Store`
+interface, two implementations, and a second file that uses them — so the
+assertions are identical across languages and only the syntax differs. Each
+language then gets the same contract asserted against it: find a symbol, outline
+a file, resolve a definition, find cross-file references, return a body, explain
+a symbol, answer or decline implementations, and rename to disk without
+disturbing line endings.
+
+The set is tied to `EXTENSION_LANGUAGES` rather than to a popularity list, and a
+test enforces that: adding a language to the detector without adding a fixture
+fails the suite. The suite cannot fall behind what the server claims to do.
+
+How much of it runs depends on what is installed, which varies a lot:
+
+| language | needs |
+|---|---|
+| C# | nothing — Roslyn fetches .NET and itself |
+| Python | uv |
+| TypeScript / JavaScript | node, npm |
+| PHP | node, npm — intelephense analyses PHP from node |
+| | *references and rename need `INTELEPHENSE_LICENSE_KEY`* |
+| Go | go, and `go install golang.org/x/tools/gopls@latest` |
+| Rust | rustup, and `rustup component add rust-analyzer` |
+| Java | a JDK |
+| Ruby | ruby, and `gem install ruby-lsp` |
+| C / C++ | clangd |
+| Kotlin | a JDK and kotlin-language-server |
+| Swift | a Swift toolchain |
+
+Anything unavailable skips with a reason naming the missing tool. CI runs the
+full matrix, one job per language, so a per-language regression is caught even
+though no single machine can run them all.
+
+Not every server implements the whole protocol, and one gates parts of it
+commercially. Where a capability is missing the contract does not go soft — it
+asserts the opposite property, that lodesman *reports* the absence rather than
+returning an empty result as though it were an answer. On unlicensed PHP,
+`find_references` must say the result is inconclusive and `rename_symbol` must
+refuse and leave the tree untouched. A confident wrong answer is the one
+failure mode an agent cannot recover from.
+
 To run them against a published release instead of the working tree:
 
 ```bash

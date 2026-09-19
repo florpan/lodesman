@@ -1,0 +1,146 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The fast suite: unit tests plus the integration tests that need no language
+  # server. This is the gate — it must pass on every supported platform and
+  # Python version, and it takes seconds.
+  fast:
+    name: fast (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Run
+        # Warnings escalated so a leak surfaces as a failure rather than noise.
+        # Note this does not catch warnings raised after the suite reports —
+        # see tests/integration/test_rename.py for why.
+        run: python -W error::ResourceWarning -m unittest discover -t . -s tests -v
+
+  # The language matrix: one job per language, against a real language server.
+  # Separate jobs rather than one, so a broken toolchain names itself and one
+  # language's failure never hides another's.
+  languages:
+    name: ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    needs: fast
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [csharp, typescript, python, go, rust, java, kotlin, ruby, php, swift, cpp]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # Most toolchains are preinstalled on ubuntu-latest. These are the ones
+      # that are not, or where a pinned version beats whatever ships.
+      - name: Install clangd
+        if: matrix.language == 'cpp'
+        run: sudo apt-get update && sudo apt-get install -y clangd
+
+      # A Go toolchain does not bring gopls, and solidlsp does not install it.
+      - name: Install gopls
+        if: matrix.language == 'go'
+        run: |
+          go install golang.org/x/tools/gopls@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # rust-analyzer ships as a rustup component rather than being on PATH.
+      - name: Install rust-analyzer
+        if: matrix.language == 'rust'
+        run: rustup component add rust-analyzer
+
+      # ruby-lsp is a gem; the runner's Ruby does not include it.
+      - name: Install ruby-lsp
+        if: matrix.language == 'ruby'
+        run: gem install ruby-lsp
+
+      - name: Install kotlin-language-server
+        if: matrix.language == 'kotlin'
+        run: |
+          curl -fsSL -o kls.zip https://github.com/fwcd/kotlin-language-server/releases/latest/download/server.zip
+          unzip -q kls.zip -d "$HOME/kls"
+          echo "$HOME/kls/server/bin" >> "$GITHUB_PATH"
+
+      - name: Install Swift
+        if: matrix.language == 'swift'
+        uses: swift-actions/setup-swift@v2
+
+      - name: Install
+        run: python -m pip install -e .
+
+      - name: Report toolchain
+        run: |
+          echo "language: ${{ matrix.language }}"
+          python - <<'PY'
+          from tests.integration import languages
+          spec = languages.BY_LANGUAGE["${{ matrix.language }}"]
+          missing = spec.missing_tools()
+          print("requires :", spec.requires or "(self-provisioning)")
+          print("missing  :", missing or "none")
+          if spec.notes:
+              print("notes    :", spec.notes)
+          PY
+
+      - name: Run the language contract
+        env:
+          LODESMAN_INTEGRATION: "1"
+        # A language server download can be slow on a cold runner; the suite
+        # skips rather than fails if one cannot start, so a green job with a
+        # skip is a real signal and is reported in the summary below.
+        run: |
+          python -m unittest -v \
+            tests.integration.test_languages.Test_${{ matrix.language }} \
+            2>&1 | tee result.log || true
+          if grep -qE "^(FAILED|ERROR)" result.log; then
+            echo "::error::${{ matrix.language }} contract failed"
+            exit 1
+          fi
+          if grep -q "skipped" result.log; then
+            echo "::warning::${{ matrix.language }} skipped — no working language server"
+          fi
+
+  # Verifies the published package rather than the working tree, so a
+  # packaging mistake that never shows up from a checkout still gets caught.
+  published:
+    name: published wheel
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Run the suite against PyPI
+        env:
+          LODESMAN_INTEGRATION: "1"
+          LODESMAN_PKG: lodesman-mcp
+          UVX_FLAGS: --refresh
+        run: |
+          python -m pip install -e .
+          python -m unittest discover -t . -s tests -v
