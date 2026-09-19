@@ -22,4 +22,4 @@ _VENDOR = Path(__file__).parent / "_vendor"
 if str(_VENDOR) not in sys.path:
     sys.path.insert(0, str(_VENDOR))
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

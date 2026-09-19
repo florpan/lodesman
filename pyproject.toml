@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lodesman-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Compiler-grade code intelligence over MCP — a language server's own answers, as agent tools"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -51,7 +51,7 @@ lodesman-mcp = "lodesman.server:main"
 packages = ["src/lodesman"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/lodesman", "scripts", "tests", "README.md", "LICENSE", "NOTICE.md", "pyproject.toml"]
+include = ["src/lodesman", "scripts", "tests", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE.md", "pyproject.toml"]
 
 # The vendored tree ships whole: its language-server manifests and the Solidity
 # preload script are data files the code reads at runtime, not dead weight.

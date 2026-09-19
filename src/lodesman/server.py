@@ -32,7 +32,6 @@ import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
 
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
@@ -40,12 +39,11 @@ from solidlsp.settings import SolidLSPSettings
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "lodesman"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.4.0"
 
 # Probe for the index-readiness gate: short, and matches something in any repo.
 WARM_PROBE = "a"
 
-# Extension -> language server id, for auto-detection.
 def _detected_languages() -> tuple[LanguageServerId, ...]:
     """
     Every language detection may pick, ordered so the tie-break is deterministic.
