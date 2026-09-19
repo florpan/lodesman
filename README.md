@@ -113,6 +113,14 @@ agrees with.
 edit code they haven't read: one tells you the cost of a change before you make
 it, the other verifies it afterwards without a full build.
 
+`rename_symbol` is a dry run by default and lists every file it would touch.
+Pass `apply=true` to write; it reports how many files actually changed on disk.
+
+Tools depend on what the language server behind them implements. `pyright`, for
+instance, does not serve `textDocument/implementation`, so `find_implementations`
+reports that rather than pretending the answer is "none" — a distinction that
+matters more to an agent than to a person.
+
 ## How it binds to a project
 
 One server process serves one repository, chosen at startup: the path you pass,
@@ -137,7 +145,32 @@ so if you try one and it breaks, please
 language, the OS and the stderr output is the most useful thing you can send.
 Testing help is very welcome.
 
-Known issues are listed here as they are found.
+### Known issues
+
+None currently open.
+
+Fixed in 0.3.1:
+
+- `rename_symbol(apply=true)` reported success while writing nothing to disk.
+  It now writes, preserves CRLF line endings, handles UTF-16 column offsets,
+  and reports the number of files whose bytes actually changed.
+- Language detection descended into dot-directories, so starting a server in a
+  home directory could bind it to a "project" made of `.cache` and `.local`.
+- Pointing the server at a directory with no recognized source files produced
+  an unhandled traceback, which an MCP client renders as "failed to connect".
+- Tools taking a `file` argument did not verify the path stayed inside the
+  repository.
+- The per-project cache key was case-folded on every platform, so on a
+  case-sensitive filesystem two distinct repositories could share one cache.
+
+## Development
+
+```bash
+git clone https://github.com/florpan/lodesman
+cd lodesman
+python -m unittest discover tests        # fast, no language server needed
+python scripts/smoke_test.py <repo> --language csharp
+```
 
 ## Built on SolidLSP
 

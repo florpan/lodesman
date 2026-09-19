@@ -40,7 +40,7 @@ from solidlsp.settings import SolidLSPSettings
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "lodesman"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 
 # Probe for the index-readiness gate: short, and matches something in any repo.
 WARM_PROBE = "a"
@@ -64,9 +64,24 @@ EXTENSION_LANGUAGES = {
 }
 
 SKIP_DIRS = {
-    "obj", "bin", "node_modules", ".git", "dist", "build",
-    ".venv", "venv", "Migrations", "__pycache__", "target",
+    "obj", "bin", "node_modules", "dist", "build",
+    "venv", "Migrations", "__pycache__", "target",
 }
+
+
+def walkable(dirnames: list[str]) -> list[str]:
+    """
+    Which subdirectories are worth descending into when surveying a repository.
+
+    Dot-directories are skipped wholesale rather than blacklisted one at a time.
+    The named list could never keep up — .tox, .mypy_cache, .direnv, .pixi,
+    .gradle, .m2 and friends all hold source-shaped files that are nobody's
+    source — and on Linux the problem is categorically worse: a survey of a home
+    directory found 2294 .py files and every single one of them was inside
+    .cache, .local or a tool's state directory. Counting those picks a language
+    for a project made entirely of other people's caches.
+    """
+    return [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
 
 
 def log(message: str) -> None:
@@ -94,7 +109,12 @@ def project_data_dir(root: Path) -> Path:
     path keeps them apart; putting it under the global home keeps it out of the
     repo, so no project needs a .gitignore entry for us.
     """
-    key = str(root).replace("\\", "/").rstrip("/").lower()
+    key = str(root).replace("\\", "/").rstrip("/")
+    # Case-fold only where the filesystem does. On Windows C:\Dev\Foo and
+    # c:\dev\foo are one repository and must share a cache; on Linux they are
+    # two repositories and must not, which is the whole point of this function.
+    if os.name == "nt":
+        key = key.lower()
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
     return solidlsp_home() / "projects" / f"{root.name}-{digest}"
 
@@ -103,7 +123,7 @@ def detect_language(root: Path) -> str:
     """Pick the language server by counting source files."""
     counts: Counter[str] = Counter()
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        dirnames[:] = walkable(dirnames)
         for name in filenames:
             language = EXTENSION_LANGUAGES.get(Path(name).suffix)
             if language:
@@ -158,7 +178,7 @@ class LanguageServerSession:
     def _find_source_file(self, within: Path | None = None) -> str | None:
         """The first source file of this session's language under `within`."""
         for dirpath, dirnames, filenames in os.walk(within or self.root):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            dirnames[:] = sorted(walkable(dirnames))
             for filename in sorted(filenames):
                 if filename.endswith(".d.ts"):
                     continue
@@ -588,6 +608,123 @@ class ToolError(Exception):
     pass
 
 
+def repo_file(target: str) -> str:
+    """
+    Validate a caller-supplied file path and return it relative to the repo.
+
+    Every tool that takes a `file` argument routes through here. The language
+    server will happily open anything the process can read, so without this a
+    caller could ask for diagnostics on /etc/passwd or a credentials file and
+    get identifiers echoed back out of it. Agents construct these paths from
+    model output, so "the caller wouldn't do that" is not an assumption
+    available to us.
+
+    Absolute paths inside the repo are accepted and made relative; anything that
+    resolves outside it is refused, including by way of "..".
+    """
+    cleaned = (target or "").replace("\\", "/").strip()
+    if not cleaned:
+        raise ToolError("file is required")
+    if _ROOT is None:
+        return cleaned
+
+    candidate = Path(cleaned)
+    resolved = (candidate if candidate.is_absolute() else _ROOT / candidate).resolve()
+    try:
+        return str(resolved.relative_to(_ROOT)).replace(os.sep, "/")
+    except ValueError:
+        raise ToolError(
+            f"{target!r} is outside the repository ({_ROOT}). This server serves "
+            "one repository; paths must stay inside it."
+        ) from None
+
+
+def utf16_index(line: str, units: int) -> int:
+    """
+    Convert an LSP character offset into a Python string index.
+
+    LSP counts a line in UTF-16 code units, not characters, so anything outside
+    the BMP — emoji, some CJK extensions — counts as two where Python counts
+    one. Indexing a str directly with an LSP offset therefore corrupts every
+    edit that follows such a character on the same line.
+    """
+    if units <= 0:
+        return 0
+    count = 0
+    for i, char in enumerate(line):
+        if count >= units:
+            return i
+        count += 2 if ord(char) > 0xFFFF else 1
+    return len(line)
+
+
+def apply_edits_to_text(text: str, edits: list[dict]) -> str:
+    """
+    Apply LSP TextEdits to a string, returning the new text.
+
+    Kept pure and separate from the file I/O so it can be tested without a
+    language server: this is the logic that was silently doing nothing.
+
+    Edits are applied last-position-first so that earlier offsets stay valid
+    while later ones are rewritten. Line terminators are never touched, which
+    is what preserves CRLF through the round trip.
+    """
+    lines = text.splitlines(keepends=True)
+    starts: list[int] = []
+    running = 0
+    for line in lines:
+        starts.append(running)
+        running += len(line)
+    starts.append(running)
+
+    def offset(position: dict) -> int:
+        line_no = position.get("line", 0)
+        if line_no >= len(lines):
+            return len(text)
+        # Measure the column against the line without its terminator, so a
+        # character offset can never run past the end of the line into the next.
+        bare = lines[line_no].rstrip("\r\n")
+        return starts[line_no] + utf16_index(bare, position.get("character", 0))
+
+    resolved = []
+    for edit in edits:
+        span = edit.get("range") or {}
+        start = offset(span.get("start") or {})
+        end = offset(span.get("end") or {})
+        resolved.append((start, max(start, end), edit.get("newText", "")))
+
+    for start, end, replacement in sorted(resolved, key=lambda e: e[0], reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def write_edits(root: Path, relative_path: str, edits: list[dict]) -> bool:
+    """
+    Apply edits to a file on disk. Returns whether the bytes actually changed.
+
+    SolidLSP's apply_text_edits_to_file only mutates its in-memory buffer and
+    notifies the language server; nothing is ever written, and the buffer is
+    discarded when its context manager exits. So we do the write ourselves,
+    which also keeps the vendored tree unmodified.
+
+    newline="" on both ends is load-bearing: without it Python's universal
+    newline translation rewrites a CRLF file to LF on the way out, quietly
+    reformatting every line of a file the user only asked to rename one symbol
+    in.
+    """
+    path = (root / relative_path).resolve()
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        original = handle.read()
+
+    updated = apply_edits_to_text(original, edits)
+    if updated == original:
+        return False
+
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(updated)
+    return True
+
+
 DEFAULT_CONTEXT_BEFORE = 2
 DEFAULT_CONTEXT_AFTER = 4
 
@@ -728,7 +865,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         return "\n".join(lines)
 
     if name == "document_symbols":
-        target = args["file"].replace("\\", "/")
+        target = repo_file(args["file"])
         symbols = symbols_of(session.server.request_document_symbols(target))
         if not symbols:
             return f"No symbols in {target} (is it excluded from the project?)."
@@ -746,7 +883,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         symbol_name = args["name"]
 
         if args.get("file") and args.get("line") is not None:
-            target = args["file"].replace("\\", "/")
+            target = repo_file(args["file"])
             line = int(args["line"]) - 1
             column = 0
             for symbol in symbols_of(session.server.request_document_symbols(target)):
@@ -867,7 +1004,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         raise ToolError(f"symbol {args['name']!r} has no usable location")
 
     if name == "check":
-        target = args["file"].replace("\\", "/")
+        target = repo_file(args["file"])
         # LSP severity: 1 error, 2 warning, 3 info, 4 hint. Default to errors and
         # warnings only — a file can carry dozens of style hints, and burying a
         # compile error under "use primary constructor" defeats the purpose.
@@ -1045,15 +1182,37 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             )
             return "\n".join(summary)
 
-        applied = 0
+        applied, unchanged, failed = 0, 0, []
         for uri, edits in changes.items():
             path = to_relative({"uri": uri})
             if not path:
                 summary.append(f"  skipped (outside the repo): {uri}")
                 continue
-            session.server.apply_text_edits_to_file(path, edits)
-            applied += 1
-        summary.append(f"\nApplied to {applied} file(s).")
+            try:
+                if write_edits(session.root, path, edits):
+                    applied += 1
+                else:
+                    unchanged += 1
+            except OSError as exc:
+                failed.append(f"  {path}: {exc}")
+
+        # Report what happened on disk, not what was attempted. The previous
+        # implementation announced success unconditionally while writing
+        # nothing, which is the worst possible failure for a tool an agent
+        # trusts enough to skip re-reading the file afterwards.
+        summary.append(f"\nWritten: {applied} file(s).")
+        if unchanged:
+            summary.append(
+                f"{unchanged} file(s) were already identical — no bytes changed."
+            )
+        if failed:
+            summary.append("Failed to write:\n" + "\n".join(failed))
+            raise ToolError("\n".join(summary))
+        if not applied and not unchanged:
+            raise ToolError("\n".join(summary + ["Nothing was written."]))
+        summary.append(
+            "Run check on an affected file to confirm the project still builds."
+        )
         return "\n".join(summary)
 
     if name == "find_implementations":
@@ -1171,7 +1330,16 @@ def main() -> int:
         return 2
 
     globals()["_ROOT"] = root
-    language = args.language or detect_language(root)
+    try:
+        language = args.language or detect_language(root)
+    except RuntimeError as exc:
+        # An MCP client renders a traceback as "failed to connect", which tells
+        # the user nothing about what to change. Match how the not-a-directory
+        # case already reports itself.
+        log(str(exc))
+        log("Pass --language to force one, or start the server in a repository "
+            "that contains source files.")
+        return 2
     session = LanguageServerSession(root, language)
     log(f"ready — repo={root} language={language} (server starts on first tool call)")
     try:
