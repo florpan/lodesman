@@ -121,18 +121,84 @@ instance, does not serve `textDocument/implementation`, so `find_implementations
 reports that rather than pretending the answer is "none" — a distinction that
 matters more to an agent than to a person.
 
-## How it binds to a project
+## Configuring it
 
-One server process serves one repository, chosen at startup: the path you pass,
-or the working directory if you pass nothing.
+**One server serves one repository, in one language, fixed at startup.** Nothing
+changes that at runtime — not a tool call, not the agent. A second repository or
+a second language means a second entry in your MCP configuration. That one
+sentence answers most of the questions people have about how to set this up.
 
-The language is detected by counting source files under that root and taking the
-majority. Pass `--language` when that guess is wrong — a repo with a TypeScript
-frontend and a C# backend has to be told which one you mean:
+### A single-language project
+
+Put it in your user configuration once and it works everywhere, because with no
+path argument the server binds to whatever directory the client launches it in:
 
 ```bash
-lodesman-mcp . --language typescript
+claude mcp add lodesman --scope user -- uvx lodesman-mcp
 ```
+
+The language is detected by counting source files under the root and taking the
+majority. Auto-detected: **C#, TypeScript/JavaScript, Python, Go, Rust, Java,
+Kotlin, Ruby, PHP, Swift, C/C++**.
+
+### A language it does not auto-detect
+
+SolidLSP ships servers for far more languages than the eleven above. Any of them
+can be used by naming it — there is just no detection for it, so it has to be
+explicit:
+
+```bash
+lodesman-mcp . --language elixir
+```
+
+### A repository with more than one language
+
+This is the common case — a backend and a frontend in one repo — and detection
+handles it badly on purpose: it picks the majority language and then knows
+nothing about the other. Give each one its own server, in a **project-scoped**
+`.mcp.json` committed alongside the code:
+
+```json
+{
+  "mcpServers": {
+    "lodesman-backend": {
+      "command": "uvx",
+      "args": ["lodesman-mcp", "backend", "--language", "csharp"]
+    },
+    "lodesman-frontend": {
+      "command": "uvx",
+      "args": ["lodesman-mcp", "frontend", "--language", "typescript"]
+    }
+  }
+}
+```
+
+Paths are relative to the directory the client launches in, so this file is
+portable between machines. MCP namespaces tools per server, so the agent sees
+`lodesman-backend`'s tools and `lodesman-frontend`'s tools as distinct and picks
+by name — which also makes the choice legible in a transcript.
+
+### Several projects in the same language
+
+Binding one server to a shared parent sometimes works and sometimes quietly
+under-reports, and it depends on the language server rather than on Lodesman.
+Measured on a repository holding two C# projects and two TypeScript projects in
+sibling folders, each server rooted at the repository root:
+
+| | result |
+|---|---|
+| C# | found symbols in **both** projects — Roslyn loads siblings |
+| TypeScript | found **one** — tsserver loaded only the project it was anchored in |
+
+So the reliable configuration is **one server per project root**, not one per
+language. Point servers at the folders that actually contain the projects. A
+shared root may work for your language, but when it does not, the symptom is an
+empty answer that looks exactly like a symbol having no references — which is
+the one result you should never take at face value.
+
+Agents get a condensed version of all of this automatically: it is sent in the
+MCP `initialize` response, so a coding agent can diagnose a misconfiguration and
+propose the fix without being told any of it.
 
 ## Status
 

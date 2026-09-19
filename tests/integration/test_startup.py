@@ -59,6 +59,17 @@ class TestToolSurface(IntegrationCase):
         with Server(self.repos["py_lf"], language="python") as server:
             self.assertEqual(set(server.tool_names()), EXPECTED_TOOLS)
 
+    def test_initialize_carries_configuration_instructions(self):
+        # The only channel that reaches an agent without a human pasting
+        # something, so it has to name the actual binding and the way out of a
+        # misconfiguration — not generic prose.
+        with Server(self.repos["py_lf"], language="python") as server:
+            instructions = server.initialize().get("instructions", "")
+        self.assertTrue(instructions, "initialize carried no instructions")
+        self.assertIn(str(self.repos["py_lf"]), instructions)
+        self.assertIn("project_info", instructions)
+        self.assertIn("--language", instructions)
+
     def test_project_info_reports_the_bound_repository(self):
         with Server(self.repos["py_lf"], language="python") as server:
             text, is_error = server.call("project_info", {})

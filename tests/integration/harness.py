@@ -121,18 +121,34 @@ class Server:
 
     # -- lifecycle --------------------------------------------------------
 
-    def language_server_ready(self, timeout: float = 600) -> bool:
+    def language_server_ready(self, timeout: float = 600, settle: float = 90) -> bool:
         """
-        Whether the language server came up, by provoking it and watching stderr.
+        Whether the language server is actually answering questions yet.
 
-        Deliberately not an assertion: a machine without tsserver or Roslyn
-        should skip the tests that need one, not fail them.
+        Requires a real answer, not merely a live process. An earlier version
+        checked only that the call did not raise and that the stderr marker had
+        appeared, which let a server that had started but could not yet resolve
+        anything report itself ready: sourcekit-lsp loads its index
+        asynchronously after startup, so it passed the probe and then failed
+        whichever test happened to run first alphabetically, while the same
+        query succeeded in a later test. A probe that tolerates a failed answer
+        is not a readiness check.
+
+        So it polls until the server resolves a symbol the fixtures all define,
+        then gives up. Returning False rather than raising is deliberate: a
+        machine without a working server should skip these tests, not fail them.
         """
-        try:
-            self.call("find_symbol", {"name": "Store"}, timeout=timeout)
-        except (ServerError, TimeoutError):
-            return False
-        return any(READY_MARKER in line for line in self.stderr)
+        deadline = time.time() + settle
+        while True:
+            try:
+                text, is_error = self.call("find_symbol", {"name": "Store"}, timeout=timeout)
+            except (ServerError, TimeoutError):
+                return False
+            if not is_error and "Store" in text:
+                return any(READY_MARKER in line for line in self.stderr)
+            if time.time() >= deadline:
+                return False
+            time.sleep(2)
 
     def wait_for_exit(self, timeout: float = 30) -> int:
         try:

@@ -1276,6 +1276,7 @@ def serve(session: LanguageServerSession) -> None:
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                    "instructions": server_instructions(),
                 },
             })
         elif method in ("notifications/initialized", "initialized"):
@@ -1309,6 +1310,45 @@ def serve(session: LanguageServerSession) -> None:
                 "id": request_id,
                 "error": {"code": -32601, "message": f"method not found: {method}"},
             })
+
+
+def server_instructions() -> str:
+    """
+    Sent in the initialize response, where MCP clients put it in front of the
+    agent. This is the only place configuration guidance reaches the agent
+    without a human pasting it, so it states what this server is bound to and
+    how to fix a misconfiguration — the two things that otherwise get
+    discovered by a confusing empty answer.
+    """
+    root = _ROOT or Path.cwd()
+    detected = ", ".join(sorted(set(EXTENSION_LANGUAGES.values())))
+    return (
+        f"Lodesman answers questions about code using a real language server, "
+        f"so results come from the compiler's understanding rather than a text "
+        f"search. This server instance is bound to {root} and serves it alone.\n\n"
+        "One server, one repository, one language, fixed at startup. There is no "
+        "tool to change any of them; a different repository or language needs "
+        "another server entry in the MCP configuration.\n\n"
+        f"Auto-detected languages: {detected}. Detection counts source files "
+        "under the root and takes the majority, so a repository holding two "
+        "languages will bind to whichever has more files and answer nothing "
+        "useful about the other.\n\n"
+        "If a query about code you can see in the repository returns nothing, "
+        "suspect the configuration before you conclude the symbol is unused. "
+        "Call project_info to see what this server actually bound to. The usual "
+        "fix is a per-project MCP entry pointing at the right folder, for "
+        "example a backend and a frontend served separately:\n"
+        '  {"mcpServers": {\n'
+        '     "lodesman-backend":  {"command": "uvx",\n'
+        '        "args": ["lodesman-mcp", "backend", "--language", "csharp"]},\n'
+        '     "lodesman-frontend": {"command": "uvx",\n'
+        '        "args": ["lodesman-mcp", "frontend", "--language", "typescript"]}}}\n'
+        "Relative paths resolve against the directory the client launches in. "
+        "Prefer binding each server to the folder that holds that language's "
+        "project rather than to a shared root: some language servers pick up "
+        "sibling projects from a parent directory and some load only one, and "
+        "the failure looks identical to a symbol having no references."
+    )
 
 
 def main() -> int:
