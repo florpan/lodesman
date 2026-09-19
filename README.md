@@ -159,7 +159,7 @@ boundary: a function declared in `api.ts` and used from both a `.tsx` and a
 `.jsx` component comes back as one answer with all of them.
 
 ```bash
-lodesman-mcp frontend --language typescript   # React, plain TS, or both
+lodesman-mcp .    # React, plain TS, or both — nothing special needed
 ```
 
 Vue and Svelte are genuinely different, because `.vue` and `.svelte` are
@@ -217,17 +217,54 @@ started for, or to name a language detection does not recognise:
 lodesman-mcp . --language elixir
 ```
 
-### Several projects in the same language
+### The one case that still needs a second entry
 
-Whether one server can cover a shared parent depends on the language server, not
-on Lodesman. Roslyn loads sibling projects from a parent directory; tsserver
-loads only the project it was anchored in, so a server rooted above two
-TypeScript projects reported symbols from one of them and nothing from the other.
+Several projects **in the same language**, where that language's server only
+searches one project at a time.
 
-So: **one server per project root** is the configuration that always works.
-A shared root may work for your language, and when it does not, the symptom is
-an empty answer indistinguishable from a symbol genuinely having no references —
-the one result never to take at face value.
+Roslyn loads sibling projects from a shared parent, so a .NET solution with
+however many `.csproj` needs nothing. tsserver does not, and it is worse than
+simply missing them. Measured on a repository holding a `web/` and an `admin/`,
+each with its own `tsconfig.json`:
+
+```
+find_symbol WebWidget      → found
+open a file in admin/      → (any tool call naming a file there)
+find_symbol AdminWidget    → found
+find_symbol WebWidget      → NOT FOUND
+```
+
+Its workspace symbol search follows whichever project it most recently saw a
+file from, so the answer depends on what you asked previously. Holding a file
+open in each project does not help — that was tried and measured.
+
+Lodesman cannot fix this from the outside, so it declares it: when a symbol is
+not found and the repository holds several projects in that language, the answer
+says so instead of reporting an absence it cannot vouch for.
+
+```
+No symbol matching 'WebWidget'.
+
+Treat this as inconclusive. This repository holds 2 separate typescript
+projects (admin, web), and that language server searches one project at a
+time, so a symbol in another project reports as missing. …
+```
+
+If that describes your repository, give each project its own entry:
+
+```json
+{
+  "mcpServers": {
+    "lodesman-web":   { "command": "uvx",
+                        "args": ["lodesman-mcp", "web"] },
+    "lodesman-admin": { "command": "uvx",
+                        "args": ["lodesman-mcp", "admin"] }
+  }
+}
+```
+
+That is the only remaining reason to run more than one. Several *languages* in
+one repository is not one of them.
 
 Agents get a condensed version of all of this automatically: it is sent in the
 MCP `initialize` response, so a coding agent can diagnose a misconfiguration and

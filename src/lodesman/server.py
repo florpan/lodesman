@@ -954,6 +954,60 @@ def workspace_hits(session: LanguageServerSession, query: str) -> list[dict]:
     return hits
 
 
+# Files that mark the root of a project, for languages whose server searches
+# one project at a time.
+PROJECT_MARKERS = {
+    "typescript": ("tsconfig.json", "jsconfig.json"),
+    "vue": ("tsconfig.json",),
+    "svelte": ("svelte.config.js", "tsconfig.json"),
+}
+
+
+def project_roots(session: LanguageServerSession) -> list[str]:
+    """Directories below the root that look like separate projects."""
+    markers = PROJECT_MARKERS.get(session.language)
+    if not markers:
+        return []
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(session.root):
+        dirnames[:] = walkable(dirnames)
+        if Path(dirpath) == session.root:
+            continue
+        if any(marker in filenames for marker in markers):
+            found.append(os.path.relpath(dirpath, session.root).replace(os.sep, "/"))
+            dirnames[:] = []  # a project's subdirectories belong to it
+    return found
+
+
+def sibling_project_caveat(session: LanguageServerSession) -> str:
+    """
+    Why an empty answer here may be a false negative rather than an absence.
+
+    tsserver's workspace symbol search covers one project at a time — the one
+    it most recently saw a file from. Measured on a repository holding a `web/`
+    and an `admin/`: asking about a symbol in `web` answered, opening any file
+    in `admin` made that symbol *stop* resolving, and the `admin` one start.
+    Anchoring a file in each does not help; the search follows the active
+    project.
+
+    So a repository with several projects in such a language can report a
+    symbol as missing when it plainly exists. That is the one answer this tool
+    must never give silently, and since it cannot be fixed from here, it is at
+    least declared.
+    """
+    roots = project_roots(session)
+    if len(roots) < 2:
+        return ""
+    listed = ", ".join(roots[:4]) + ("…" if len(roots) > 4 else "")
+    return (
+        f"\n\nTreat this as inconclusive. This repository holds {len(roots)} "
+        f"separate {session.language} projects ({listed}), and that language "
+        "server searches one project at a time, so a symbol in another project "
+        "reports as missing. To search them reliably, run one server per "
+        "project root rather than one at the repository root."
+    )
+
+
 def candidates_for(session: LanguageServerSession, name: str) -> list[dict]:
     """Ranked declarations to try for `name` — exact matches only if any exist."""
     hits = workspace_hits(session, name)
@@ -990,7 +1044,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         limit = int(args.get("limit", 25))
         hits = workspace_hits(session, query)
         if not hits:
-            return f"No symbol matching {query!r}."
+            return f"No symbol matching {query!r}." + sibling_project_caveat(session)
         # Most-likely-intended first, so the ordering does not depend on Roslyn's.
         hits = rank_candidates(hits, query)
         lines = [f"{len(hits)} match(es) for {query!r}:"]
