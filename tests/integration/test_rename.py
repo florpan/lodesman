@@ -41,7 +41,13 @@ class RenameCase(unittest.TestCase):
     fixture = "py_lf"
 
     def setUp(self) -> None:
+        # addCleanup rather than tearDown: tearDown does not run when setUp
+        # raises SkipTest, so the skip path below would otherwise leak both the
+        # temporary directory and the server process. Registering each cleanup
+        # as soon as the resource exists covers every exit from setUp.
         self._tmp = tempfile.TemporaryDirectory(prefix="lodesman-rename-")
+        self.addCleanup(self._tmp.cleanup)
+
         root = Path(self._tmp.name)
         builders = {
             "py_lf": lambda: fixtures.python_repo(root / "r"),
@@ -50,15 +56,12 @@ class RenameCase(unittest.TestCase):
             "ts": lambda: fixtures.typescript_repo(root / "r"),
         }
         self.repo = builders[self.fixture]()
+
         self.server = Server(self.repo, language=self.language)
+        self.addCleanup(self.server.close)
         self.server.initialize()
         if not self.server.language_server_ready():
-            self.server.close()
             self.skipTest(f"no working {self.language} language server on this machine")
-
-    def tearDown(self) -> None:
-        self.server.close()
-        self._tmp.cleanup()
 
     def snapshot(self) -> dict[Path, bytes]:
         return {p: p.read_bytes() for p in self.repo.rglob("*")

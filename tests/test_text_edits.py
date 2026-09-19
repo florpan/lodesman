@@ -8,10 +8,13 @@ it delegated to mutates an in-memory buffer and discards it. A test asserting
 that bytes on disk actually change would have caught that immediately, so that
 assertion is the first one here.
 
-Deliberately stdlib-only and language-server-free: this is pure text
-manipulation and should stay runnable in a second.
+Deliberately language-server-free: this is pure text manipulation and should
+stay runnable in a second. It asserts against nothing but the standard library,
+though importing lodesman.server does pull in SolidLSP's runtime dependencies,
+so the package needs installing first.
 
-    python -m unittest discover tests
+    pip install -e .
+    python -m unittest discover -t . -s tests
 """
 
 from __future__ import annotations

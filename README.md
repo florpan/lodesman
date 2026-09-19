@@ -168,8 +168,14 @@ Fixed in 0.3.1:
 ```bash
 git clone https://github.com/florpan/lodesman
 cd lodesman
+pip install -e .          # or: uv pip install -e .
 python -m unittest discover -t . -s tests
 ```
+
+Install before running the tests. Nothing in the suite asserts against a
+third-party library, but importing the server pulls in the vendored SolidLSP
+and therefore its dependencies, so on a bare interpreter the modules fail at
+the loader rather than at an assertion.
 
 That runs the unit tests and the integration tests that need no language
 server — startup, language detection, the tool surface, and path containment,
@@ -183,8 +189,13 @@ machine has to download one first:
 LODESMAN_INTEGRATION=1 python -m unittest discover -t . -s tests
 ```
 
-They skip rather than fail if no working language server is available. To run
-them against a published release instead of the working tree:
+They skip rather than fail if no working language server is available. Note
+that "no language server" is narrower than it sounds: SolidLSP launches pyright
+through `uvx`, which brings its own runtime, so the Python tests run on any
+machine with uv even without node — only the TypeScript ones need node. Good
+for coverage, but the two conditions are not the same claim.
+
+To run them against a published release instead of the working tree:
 
 ```bash
 LODESMAN_PKG=lodesman-mcp@0.3.1 UVX_FLAGS=--refresh \

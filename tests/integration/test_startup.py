@@ -32,12 +32,12 @@ class IntegrationCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        # addClassCleanup for the same reason setUp uses addCleanup elsewhere:
+        # tearDownClass does not run if setUpClass raises, so registering the
+        # cleanup with the resource covers every exit.
         cls._tmp = tempfile.TemporaryDirectory(prefix="lodesman-it-")
+        cls.addClassCleanup(cls._tmp.cleanup)
         cls.repos = fixtures.build_all(Path(cls._tmp.name))
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls._tmp.cleanup()
 
     def stderr_line(self, server: Server, needle: str, timeout: float = 30) -> str:
         deadline = time.time() + timeout
@@ -81,11 +81,14 @@ class TestNoSourceFiles(unittest.TestCase):
                 capture_output=True, text=True, encoding="utf-8", timeout=120,
                 env={**os.environ, "PYTHONPATH": str(SRC)},
             )
-        self.assertEqual(result.returncode, 2)
-        self.assertNotIn("Traceback", result.stderr)
+        # Assert on stderr before the exit code. Any other crash — a missing
+        # runtime dependency, say — also exits non-zero, and "1 != 2" points at
+        # the wrong thing; the traceback in stderr names the real cause.
+        self.assertNotIn("Traceback", result.stderr, f"crashed instead:\n{result.stderr}")
         self.assertIn("no recognized source files", result.stderr)
         # The message has to say what to do about it, not just what went wrong.
         self.assertIn("--language", result.stderr)
+        self.assertEqual(result.returncode, 2)
 
 
 class TestPathContainment(IntegrationCase):
