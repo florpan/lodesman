@@ -276,22 +276,29 @@ The set is tied to `EXTENSION_LANGUAGES` rather than to a popularity list, and a
 test enforces that: adding a language to the detector without adding a fixture
 fails the suite. The suite cannot fall behind what the server claims to do.
 
-How much of it runs depends on what is installed, which varies a lot:
+What actually passes, measured in CI on every push rather than claimed:
 
-| language | needs |
-|---|---|
-| C# | nothing — Roslyn fetches .NET and itself |
-| Python | uv |
-| TypeScript / JavaScript | node, npm |
-| PHP | node, npm — intelephense analyses PHP from node |
-| | *references and rename need `INTELEPHENSE_LICENSE_KEY`* |
-| Go | go, and `go install golang.org/x/tools/gopls@latest` |
-| Rust | rustup, and `rustup component add rust-analyzer` |
-| Java | a JDK |
-| Ruby | ruby, and `gem install ruby-lsp` |
-| C / C++ | clangd |
-| Kotlin | a JDK and kotlin-language-server |
-| Swift | a Swift toolchain |
+| language | contract | needs |
+|---|---|---|
+| C# | ✅ 8/8 | nothing — Roslyn fetches .NET and itself |
+| TypeScript / JavaScript | ✅ 8/8 | node, npm |
+| Python | ✅ 8/8 | uv |
+| Go | ✅ 8/8 | go, and `go install golang.org/x/tools/gopls@latest` |
+| Rust | ✅ 8/8 | rustup, and `rustup component add rust-analyzer` |
+| Java | ✅ 8/8 | a JDK |
+| C / C++ | ✅ 8/8 | clangd |
+| Swift | ✅ 8/8 | a Swift toolchain; the package is built first |
+| PHP | ✅ 8/8 | node, npm — intelephense analyses PHP from node. References and rename need `INTELEPHENSE_LICENSE_KEY`; without one they are refused rather than answered emptily |
+| Kotlin | ⚠️ unverified | a JDK and kotlin-language-server. Starts, then resolves no workspace symbols — it wants a resolved Gradle classpath |
+| Ruby | ⚠️ unverified | ruby, and `gem install ruby-lsp`. Starts, then resolves no workspace symbols — probably wants a bundled project |
+
+The two unverified rows are honest rather than pessimistic: the servers install
+and start, and then answer nothing about a fixture that plainly declares the
+symbols being asked for. Until that is understood, treat them as untested.
+
+A skip is not a pass, and CI enforces that: a language that runs no tests fails
+the build unless `languages.py` records *why* it cannot run. A green tick that
+might mean "ran eight assertions" or might mean "ran nothing" is worth nothing.
 
 Anything unavailable skips with a reason naming the missing tool. CI runs the
 full matrix, one job per language, so a per-language regression is caught even

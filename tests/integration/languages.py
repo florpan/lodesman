@@ -67,6 +67,17 @@ class LanguageSpec:
     that language up, not a workaround.
     """
 
+    known_gap: str = ""
+    """
+    Why this language is not expected to pass yet, if it is not.
+
+    Recorded here rather than left to a log, so that CI can tell an expected
+    skip from a regression: a language with no known_gap that skips is a
+    failure, because CI installs the toolchain deliberately. Without this a
+    green tick can mean "ran eight assertions" or "ran nothing at all", and
+    those should not look the same.
+    """
+
     notes: str = ""
 
     def missing_tools(self) -> list[str]:
@@ -539,6 +550,11 @@ KOTLIN = LanguageSpec(
     language="kotlin",
     outline_file="src/main/kotlin/fixture/Store.kt",
     requires=("java", "kotlin-language-server"),
+    known_gap=(
+        "Server starts but resolves no workspace symbols within 90s. It wants a "
+        "resolved Gradle classpath, which the fixture does not build. Observed in "
+        "CI on 2026-09-19 with java and kotlin-language-server both present."
+    ),
     notes="kotlin-language-server ships as a script; there is no auto-install path.",
     files={
         "build.gradle.kts": (
@@ -591,6 +607,11 @@ RUBY = LanguageSpec(
     language="ruby",
     outline_file="lib/store.rb",
     requires=("ruby", "gem"),
+    known_gap=(
+        "Server starts but resolves no workspace symbols within 90s. Probably wants "
+        "a bundled project rather than bare .rb files. Observed in CI on 2026-09-19 "
+        "with ruby and ruby-lsp both present."
+    ),
     files={
         "Gemfile": 'source "https://rubygems.org"\n',
         "lib/store.rb": (

@@ -109,19 +109,31 @@ jobs:
       - name: Run the language contract
         env:
           LODESMAN_INTEGRATION: "1"
-        # A language server download can be slow on a cold runner; the suite
-        # skips rather than fails if one cannot start, so a green job with a
-        # skip is a real signal and is reported in the summary below.
+        # A skip here is not a pass. CI installs the toolchain deliberately, so
+        # a language that skips anyway has a problem — and a green tick that can
+        # mean either "ran eight assertions" or "ran nothing" is worthless.
+        # Languages with a recorded known_gap in languages.py are allowed to
+        # skip; everything else must actually run.
         run: |
           python -m unittest -v \
             tests.integration.test_languages.Test_${{ matrix.language }} \
             2>&1 | tee result.log || true
+
           if grep -qE "^(FAILED|ERROR)" result.log; then
             echo "::error::${{ matrix.language }} contract failed"
             exit 1
           fi
-          if grep -q "skipped" result.log; then
-            echo "::warning::${{ matrix.language }} skipped — no working language server"
+
+          if grep -qE "^Ran 0 tests|skipped=" result.log; then
+            gap=$(python -c "
+          from tests.integration import languages
+          print(languages.BY_LANGUAGE['${{ matrix.language }}'].known_gap)")
+            if [ -n "$gap" ]; then
+              echo "::warning::${{ matrix.language }} skipped, known gap: $gap"
+            else
+              echo "::error::${{ matrix.language }} ran no tests and has no recorded known_gap in languages.py. Either it regressed, or record why it cannot run."
+              exit 1
+            fi
           fi
 
   # Verifies the published package rather than the working tree, so a
