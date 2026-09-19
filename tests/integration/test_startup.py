@@ -108,6 +108,61 @@ class TestNoSourceFiles(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
 
+class TestMultipleLanguages(unittest.TestCase):
+    """
+    One server, several languages.
+
+    None of this needs a language server: detection happens at startup,
+    project_info never touches one, and a file routed to a language nobody
+    serves is refused before anything starts. So it runs everywhere.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="lodesman-multi-")
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name).resolve() / "repo"
+        # A .NET solution with a TypeScript frontend, the shape the README
+        # documents and the reason the pool exists.
+        fixtures.python_repo(root / "service")
+        fixtures.typescript_repo(root / "web")
+        self.repo = root
+
+    def start(self, *extra: str) -> Server:
+        server = Server(self.repo, extra_args=extra)
+        self.addCleanup(server.close)
+        server.initialize()
+        return server
+
+    def test_both_languages_are_detected_and_reported(self):
+        server = self.start()
+        info, is_error = server.call("project_info", {})
+        self.assertFalse(is_error, info)
+        self.assertIn("python", info)
+        self.assertIn("typescript", info)
+
+    def test_nothing_starts_until_something_asks(self):
+        server = self.start()
+        info, _ = server.call("project_info", {})
+        # The whole point of the pool: detection is cheap, servers are not.
+        self.assertIn("none started yet", info)
+
+    def test_a_file_of_an_unserved_language_is_refused_clearly(self):
+        server = self.start()
+        (self.repo / "notes.md").write_text("# notes\n", encoding="utf-8")
+        text, is_error = server.call("document_symbols", {"file": "notes.md"})
+        self.assertTrue(is_error, text)
+        self.assertIn("not a file this server handles", text)
+        # The refusal has to say what it does serve, or it is a dead end.
+        self.assertIn("python", text)
+        self.assertIn("typescript", text)
+
+    def test_forcing_a_language_serves_only_that_one(self):
+        server = self.start("--language", "typescript")
+        info, _ = server.call("project_info", {})
+        self.assertIn("typescript", info)
+        self.assertNotIn("python", info.split("running")[0])
+
+
 class TestPathContainment(IntegrationCase):
     """Finding #4: check() would read and echo any file the process could open."""
 
