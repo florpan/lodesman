@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tests.integration import fixtures
@@ -153,6 +154,58 @@ class TestRenameTypeScript(RenameCase):
         self.assertFalse(is_error, found)
         self.assertIn("2 implementation(s)", found)
         self.assertEqual(found.count("src/store.ts:"), 3)  # 1 resolution + 2 hits
+
+
+class TestSetUpFailureCleansUp(unittest.TestCase):
+    """
+    A fault inside setUp must still release what setUp had already acquired.
+
+    The skip path never exercised this: it closed the server explicitly before
+    skipping, so only the temporary directory leaked there. The exposure is on
+    the paths no explicit close covers — an exception out of Server(),
+    initialize(), or language_server_ready() — where tearDown would not run and
+    the process would be left to a finalizer. Registering cleanups at creation
+    covers all of them, and this is the test for that.
+
+    Needs no language server: the injected failure happens before one is asked
+    for, which is why this runs by default rather than behind
+    LODESMAN_INTEGRATION.
+    """
+
+    def test_exception_from_initialize_closes_server_and_removes_fixture(self):
+        class Faulty(TestRenameWritesToDisk):
+            pass
+
+        Faulty.__unittest_skip__ = False  # bypass the opt-in gate, not the setUp
+        case = Faulty("test_apply_true_changes_bytes")
+
+        closed: list[Server] = []
+        real_close = Server.close
+
+        def recording_close(server: Server) -> None:
+            closed.append(server)
+            real_close(server)
+
+        def boom(server: Server) -> dict:
+            raise RuntimeError("injected failure")
+
+        with unittest.mock.patch.object(Server, "initialize", boom), \
+                unittest.mock.patch.object(Server, "close", recording_close):
+            result = unittest.TestResult()
+            case.run(result)
+
+        self.assertEqual(len(result.errors), 1, result.errors)
+        self.assertIn("injected failure", result.errors[0][1])
+
+        # Assert close() was called, not that the process died. The process
+        # exits either way once its stdin pipe is finalised and it reads EOF,
+        # so process death does not distinguish a registered cleanup from a
+        # missing one — it would make this test pass against the bug it exists
+        # to catch.
+        self.assertEqual(len(closed), 1,
+                         "setUp failed without closing the server it had started")
+        self.assertFalse(Path(case._tmp.name).exists(),
+                         "the fixture directory was left on disk")
 
 
 if __name__ == "__main__":
