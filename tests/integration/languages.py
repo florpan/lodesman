@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -65,6 +65,16 @@ class LanguageSpec:
     a compiled index store, so without a build it reports no symbol named
     'Record' in a file that plainly declares one. Building is part of setting
     that language up, not a workaround.
+    """
+
+    known_failures: dict[str, str] = field(default_factory=dict)
+    """
+    Individual contract tests known to fail, mapped to why.
+
+    Skipped with the reason rather than left to fail, so that a language that
+    mostly works is not represented as a red build, and so that a *new* failure
+    in the same language still is one. The reason has to say what was ruled out,
+    not just that it fails.
     """
 
     known_gap: str = ""
@@ -549,14 +559,17 @@ JAVA = LanguageSpec(
 KOTLIN = LanguageSpec(
     language="kotlin",
     outline_file="src/main/kotlin/fixture/Store.kt",
-    requires=("java", "kotlin-language-server"),
+    # Not kotlin-language-server: SolidLSP downloads JetBrains intellij-server and
+    # never invokes fwcd's binary, so gating on it tested the wrong thing entirely.
+    requires=("java",),
     known_gap=(
-        "The language server process terminates during the LSP initialize "
-        "handshake: LanguageServerTerminatedException, 'Language server stdout "
-        "read process terminated unexpectedly'. Observed in CI on 2026-09-19 with "
-        "java and kotlin-language-server both on PATH. Cause not yet determined — "
-        "it dies before any project loading or indexing could be involved, so this "
-        "is not about the Gradle classpath."
+        "SolidLSP's pinned build has expired. It downloads JetBrains intellij-server "
+        "at DEFAULT_KOTLIN_LSP_VERSION = 262.9593.0, and that build now prints 'This "
+        "build of intellij-server has expired' to stdout and exits immediately, which "
+        "surfaces as a LanguageServerTerminatedException during initialize. Diagnosed "
+        "2026-09-19 on Linux; upstream tracks it as oraios/serena#2008. Pinning "
+        "263.4702.0 via ls_specific_settings makes the full contract pass 8/8, but "
+        "that moves an expiring EAP pin into this repository — see the README."
     ),
     notes="kotlin-language-server ships as a script; there is no auto-install path.",
     files={
@@ -609,14 +622,24 @@ KOTLIN = LanguageSpec(
 RUBY = LanguageSpec(
     language="ruby",
     outline_file="lib/store.rb",
-    requires=("ruby", "gem"),
-    known_gap=(
-        "The language server process terminates during the LSP initialize "
-        "handshake: LanguageServerTerminatedException, 'Language server stdout "
-        "read process terminated unexpectedly'. Observed in CI on 2026-09-19 with "
-        "ruby and ruby-lsp both present. Cause not yet determined — it dies before "
-        "reaching any project, so this is not about bundler or the fixture layout."
-    ),
+    requires=("ruby", "gem", "bundle"),
+    # ruby-lsp's launcher calls setup_bundler unconditionally, and a Gemfile with
+    # no Gemfile.lock makes it exit(78) before completing the handshake:
+    # "Project contains a Gemfile, but no Gemfile.lock. Run `bundle install`".
+    # That is what looked like a protocol failure. Locking the fixture fixes it.
+    prebuild=("bundle", "lock"),
+    known_failures={
+        "test_find_references_crosses_files":
+            "ruby-lsp returns no references for a class used in a sibling file. Not "
+            "a capability gap — it advertises referencesProvider: true — and not "
+            "timing: raising its 500ms cross-file wait to 8s changed nothing. "
+            "Unexplained as of 2026-09-19.",
+        "test_rename_writes_to_disk_and_preserves_line_endings":
+            "ruby-lsp produces no edits, while advertising renameProvider with "
+            "prepareProvider: true. Same root cause as the references gap, most "
+            "likely. Unexplained as of 2026-09-19.",
+    },
+    known_gap="",
     files={
         "Gemfile": 'source "https://rubygems.org"\n',
         "lib/store.rb": (

@@ -321,16 +321,36 @@ What actually passes, measured in CI on every push rather than claimed:
 | C / C++ | ✅ 8/8 | clangd |
 | Swift | ✅ 8/8 | a Swift toolchain; the package is built first |
 | PHP | ✅ 8/8 | node, npm — intelephense analyses PHP from node. References and rename need `INTELEPHENSE_LICENSE_KEY`; without one they are refused rather than answered emptily |
-| Kotlin | ⚠️ unverified | a JDK and kotlin-language-server |
-| Ruby | ⚠️ unverified | ruby, and `gem install ruby-lsp` |
+| Ruby | ⚠️ 6/8 | ruby, bundler, and `gem install ruby-lsp` |
+| Kotlin | ⚠️ blocked | a JDK — SolidLSP downloads its own server |
 
-Both unverified rows fail the same way, and it is not subtle: with the toolchain
-installed and on PATH, the language server process **terminates during the LSP
-initialize handshake** — `LanguageServerTerminatedException: Language server
-stdout read process terminated unexpectedly`. It dies before reaching any
-project, so nothing about classpaths, bundles or fixture layout is involved. The
-cause is not yet known. Until it is, treat both as untested rather than broken
-in a way anyone understands.
+**Ruby** passes six of the eight. `find_references` and `rename_symbol` return
+nothing, and it is not a capability gap — ruby-lsp advertises both
+`referencesProvider` and `renameProvider` — nor timing, since raising its
+internal cross-file wait from 500 ms to 8 s changed nothing. Unexplained.
+
+**Kotlin** is blocked upstream, not by anything here. SolidLSP downloads
+JetBrains `intellij-server` pinned at `262.9593.0`, and **that build has
+expired**: it prints `This build of intellij-server has expired` to stdout and
+exits, which surfaces as the server dying during the LSP handshake. Tracked as
+[oraios/serena#2008](https://github.com/oraios/serena/issues/2008).
+
+Pinning `263.4702.0` makes Kotlin pass 8/8, verified on Linux. It is not enabled
+by default, because doing so moves an expiring EAP pin out of upstream and into
+this repository: that build is on the same clock that killed the last one in
+under two months, and an overridden version is downloaded without the hash
+verification SolidLSP applies to its own defaults. The failure mode is a green
+build turning red with no code change. To opt in locally, set it when
+constructing `SolidLSPSettings`:
+
+```python
+ls_specific_settings={"kotlin": {"kotlin_lsp_version": "263.4702.0"}}
+```
+
+Use the string key, not `LanguageServerId.KOTLIN`. The vendored tree is imported
+as a bare `solidlsp`, so an enum from a different import path fails an
+`isinstance` check inside SolidLSP and the setting is silently ignored — no
+error, no warning, and the old version downloads anyway.
 
 A skip is not a pass, and CI enforces that: a language that runs no tests fails
 the build unless `languages.py` records *why* it cannot run. A green tick that

@@ -103,6 +103,14 @@ class LanguageContract:
             self.skipTest(f"{self.spec.language}: language server did not start")
         return repo, server
 
+    def setUp(self) -> None:
+        # A test recorded as a known failure is skipped with its reason, so that
+        # a language which mostly works is not shown as a red build while a new
+        # failure in the same language still is one.
+        reason = self.spec.known_failures.get(self._testMethodName)
+        if reason:
+            self.skipTest(f"{self.spec.language}: known failure — {reason}")
+
     def snapshot(self, repo: Path) -> dict[str, bytes]:
         """
         The bytes of the fixture's own files, and nothing else.
