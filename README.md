@@ -321,12 +321,16 @@ What actually passes, measured in CI on every push rather than claimed:
 | C / C++ | ✅ 8/8 | clangd |
 | Swift | ✅ 8/8 | a Swift toolchain; the package is built first |
 | PHP | ✅ 8/8 | node, npm — intelephense analyses PHP from node. References and rename need `INTELEPHENSE_LICENSE_KEY`; without one they are refused rather than answered emptily |
-| Kotlin | ⚠️ unverified | a JDK and kotlin-language-server. Starts, then resolves no workspace symbols — it wants a resolved Gradle classpath |
-| Ruby | ⚠️ unverified | ruby, and `gem install ruby-lsp`. Starts, then resolves no workspace symbols — probably wants a bundled project |
+| Kotlin | ⚠️ unverified | a JDK and kotlin-language-server |
+| Ruby | ⚠️ unverified | ruby, and `gem install ruby-lsp` |
 
-The two unverified rows are honest rather than pessimistic: the servers install
-and start, and then answer nothing about a fixture that plainly declares the
-symbols being asked for. Until that is understood, treat them as untested.
+Both unverified rows fail the same way, and it is not subtle: with the toolchain
+installed and on PATH, the language server process **terminates during the LSP
+initialize handshake** — `LanguageServerTerminatedException: Language server
+stdout read process terminated unexpectedly`. It dies before reaching any
+project, so nothing about classpaths, bundles or fixture layout is involved. The
+cause is not yet known. Until it is, treat both as untested rather than broken
+in a way anyone understands.
 
 A skip is not a pass, and CI enforces that: a language that runs no tests fails
 the build unless `languages.py` records *why* it cannot run. A green tick that

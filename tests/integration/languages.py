@@ -551,9 +551,12 @@ KOTLIN = LanguageSpec(
     outline_file="src/main/kotlin/fixture/Store.kt",
     requires=("java", "kotlin-language-server"),
     known_gap=(
-        "Server starts but resolves no workspace symbols within 90s. It wants a "
-        "resolved Gradle classpath, which the fixture does not build. Observed in "
-        "CI on 2026-09-19 with java and kotlin-language-server both present."
+        "The language server process terminates during the LSP initialize "
+        "handshake: LanguageServerTerminatedException, 'Language server stdout "
+        "read process terminated unexpectedly'. Observed in CI on 2026-09-19 with "
+        "java and kotlin-language-server both on PATH. Cause not yet determined — "
+        "it dies before any project loading or indexing could be involved, so this "
+        "is not about the Gradle classpath."
     ),
     notes="kotlin-language-server ships as a script; there is no auto-install path.",
     files={
@@ -608,9 +611,11 @@ RUBY = LanguageSpec(
     outline_file="lib/store.rb",
     requires=("ruby", "gem"),
     known_gap=(
-        "Server starts but resolves no workspace symbols within 90s. Probably wants "
-        "a bundled project rather than bare .rb files. Observed in CI on 2026-09-19 "
-        "with ruby and ruby-lsp both present."
+        "The language server process terminates during the LSP initialize "
+        "handshake: LanguageServerTerminatedException, 'Language server stdout "
+        "read process terminated unexpectedly'. Observed in CI on 2026-09-19 with "
+        "ruby and ruby-lsp both present. Cause not yet determined — it dies before "
+        "reaching any project, so this is not about bundler or the fixture layout."
     ),
     files={
         "Gemfile": 'source "https://rubygems.org"\n',
