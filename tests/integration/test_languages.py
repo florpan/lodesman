@@ -228,23 +228,43 @@ for _spec in languages.SPECS:
 del _spec, _case
 
 
-class TestCoverage(unittest.TestCase):
-    """The suite must not fall behind what the server claims to detect."""
+# The languages this project claims to have verified, which is a documentation
+# claim and therefore deliberately maintained by hand. Detection covers far
+# more — trying an untested language beats refusing to start — but the README
+# may only advertise what has a fixture behind it. Changing this list is a
+# conscious act that shows up in review.
+VERIFIED_LANGUAGES = {
+    "csharp", "typescript", "python", "go", "rust",
+    "java", "kotlin", "ruby", "php", "swift", "cpp",
+}
 
-    def test_every_detectable_language_has_a_fixture(self):
-        missing = languages.detectable_languages() - set(languages.BY_LANGUAGE)
+
+class TestCoverage(unittest.TestCase):
+    """Detection may be generous; the claim of verification may not be."""
+
+    def test_every_verified_language_has_a_fixture(self):
+        missing = VERIFIED_LANGUAGES - set(languages.BY_LANGUAGE)
         self.assertEqual(
             missing, set(),
-            "EXTENSION_LANGUAGES maps these to a language server, but no fixture "
-            f"exists for them: {sorted(missing)}. Add one to languages.py, or stop "
-            "claiming to detect them.",
+            f"claimed as verified but no fixture exists: {sorted(missing)}. Add one "
+            "to languages.py, or stop claiming it.",
         )
 
     def test_no_fixture_is_orphaned(self):
-        extra = set(languages.BY_LANGUAGE) - languages.detectable_languages()
+        extra = set(languages.BY_LANGUAGE) - VERIFIED_LANGUAGES
         self.assertEqual(
             extra, set(),
-            f"fixtures exist for languages the detector does not recognise: {sorted(extra)}",
+            f"fixtures exist for languages not listed as verified: {sorted(extra)}. "
+            "Add them to VERIFIED_LANGUAGES and to the README table.",
+        )
+
+    def test_verified_languages_are_all_detectable(self):
+        # A language we test but cannot detect would only ever be reachable by
+        # naming it explicitly, which is not what the README implies.
+        undetectable = VERIFIED_LANGUAGES - languages.detectable_languages()
+        self.assertEqual(
+            undetectable, set(),
+            f"verified but not detectable: {sorted(undetectable)}",
         )
 
 

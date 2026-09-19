@@ -29,18 +29,33 @@ class TestExtensionCoverage(unittest.TestCase):
                 with self.subTest(language=language_id.value, extension=extension):
                     self.assertIn(extension, EXTENSION_LANGUAGES)
 
-    def test_no_extension_is_claimed_by_two_languages(self):
-        # Overlaps are resolved by declaration order, which is a silent and
-        # arbitrary tie-break. There are none today; this says so out loud.
-        seen: dict[str, str] = {}
+    def test_contested_extensions_go_to_the_higher_priority_language(self):
+        # Several languages claim the same extensions — Vue and Svelte both
+        # handle .ts, because they are supersets of TypeScript. SolidLSP's
+        # priority field exists to settle exactly that, and the map must honour
+        # it rather than whichever language happened to be declared first.
+        claimants: dict[str, list] = {}
         for language_id in DETECTED_LANGUAGES:
             for extension in language_id.get_source_fn_matcher().file_extensions:
-                if extension in seen and seen[extension] != language_id.value:
-                    self.fail(
-                        f"{extension} claimed by both {seen[extension]} and "
-                        f"{language_id.value}; detection order decides silently"
-                    )
-                seen[extension] = language_id.value
+                claimants.setdefault(extension, []).append(language_id)
+
+        contested = {e: c for e, c in claimants.items() if len(c) > 1}
+        self.assertTrue(contested, "expected some contested extensions to check")
+
+        for extension, candidates in contested.items():
+            best = max(candidate.get_priority() for candidate in candidates)
+            winners = {c.value for c in candidates if c.get_priority() == best}
+            with self.subTest(extension=extension):
+                self.assertIn(EXTENSION_LANGUAGES[extension], winners)
+
+    def test_supersets_do_not_steal_the_base_language(self):
+        # The concrete case this protects: a TypeScript project must not be
+        # detected as Vue merely because the Vue server also handles .ts.
+        self.assertEqual(EXTENSION_LANGUAGES[".ts"], "typescript")
+        self.assertEqual(EXTENSION_LANGUAGES[".js"], "typescript")
+        # while their own formats still belong to them
+        self.assertEqual(EXTENSION_LANGUAGES[".vue"], "vue")
+        self.assertEqual(EXTENSION_LANGUAGES[".svelte"], "svelte")
 
     def test_the_familiar_extensions_resolve(self):
         expected = {

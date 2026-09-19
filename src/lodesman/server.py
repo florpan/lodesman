@@ -46,40 +46,56 @@ SERVER_VERSION = "0.3.1"
 WARM_PROBE = "a"
 
 # Extension -> language server id, for auto-detection.
-# The languages detection knows about. Every one has a fixture in
-# tests/integration/languages.py, and a test fails if that stops being true.
-DETECTED_LANGUAGES = (
-    LanguageServerId.CSHARP,
-    LanguageServerId.TYPESCRIPT,
-    LanguageServerId.PYTHON,
-    LanguageServerId.GO,
-    LanguageServerId.RUST,
-    LanguageServerId.JAVA,
-    LanguageServerId.KOTLIN,
-    LanguageServerId.RUBY,
-    LanguageServerId.PHP,
-    LanguageServerId.SWIFT,
-    LanguageServerId.CPP,
-)
+def _detected_languages() -> tuple[LanguageServerId, ...]:
+    """
+    Every language detection may pick, ordered so the tie-break is deterministic.
+
+    Taken from SolidLSP rather than curated here. Detection deliberately covers
+    more than the set verified in CI: refusing to start on a language nobody has
+    tested is strictly worse than trying it, as the .jsx case showed, where an
+    ordinary React project was reported as containing no source files at all.
+    What is *verified* is a documentation claim, and belongs in the README.
+
+    Excluded are the experimental servers and the non-programming ones —
+    markdown, json, yaml and friends. A server exists for those, but they have
+    almost no cross-file symbol structure, so the tools would answer nothing
+    useful while making every repository look multi-language.
+
+    Sorted by SolidLSP's own priority, highest first, because several languages
+    claim the same extensions. That field exists for exactly this: Vue and
+    Svelte are supersets of TypeScript and rank below it, so `.ts` belongs to
+    TypeScript while `.vue` still belongs to Vue. Name is the final tie-break,
+    so the result does not depend on enum declaration order.
+    """
+    return tuple(sorted(
+        LanguageServerId.iter_all(
+            include_experimental=False, include_non_programming_languages=False
+        ),
+        key=lambda lid: (-lid.get_priority(), lid.value),
+    ))
+
+
+DETECTED_LANGUAGES = _detected_languages()
 
 
 def _extension_languages() -> dict[str, str]:
     """
     Extension -> language, taken from each server's own idea of what it handles.
 
-    Hand-listing these was wrong in a way that only shows up on real projects.
-    The list here used to be .ts, .tsx and .js, while tsserver actually handles
-    twelve extensions — so a React codebase written in .jsx, or anything modern
-    using .mts or .mjs, contained no "recognized source files" at all and the
-    server exited rather than starting. Deriving the map means a language server
-    that learns a new extension is picked up without anyone remembering to.
+    Hand-listing these was wrong in a way that only showed up on real projects.
+    The list used to be .ts, .tsx and .js, while tsserver actually handles
+    twelve extensions — so a React codebase written in .jsx contained no
+    "recognized source files" and the server exited rather than starting.
+    Deriving the map means a server that learns a new extension is picked up
+    without anyone remembering to.
     """
     mapping: dict[str, str] = {}
     for language_id in DETECTED_LANGUAGES:
         for extension in language_id.get_source_fn_matcher().file_extensions:
-            # First declaration wins, so the order above is the tie-break. There
-            # are no overlaps today; this only decides what happens if upstream
-            # introduces one.
+            # First wins, and the ordering above makes that the higher-priority
+            # language. Equal priority falls back to name, which is arbitrary
+            # but stable — .m being claimed by cpp rather than matlab is a
+            # coin-toss nobody has a better answer for.
             mapping.setdefault(extension, language_id.value)
     return mapping
 
@@ -142,20 +158,58 @@ def project_data_dir(root: Path) -> Path:
     return solidlsp_home() / "projects" / f"{root.name}-{digest}"
 
 
-def detect_language(root: Path) -> str:
-    """Pick the language server by counting source files."""
+# How many languages one repository will serve at once. A repository can
+# legitimately contain a dozen; starting a language server for each would cost
+# gigabytes and minutes for languages nobody is going to ask about.
+MAX_LANGUAGES = 4
+
+# Languages below this share of the recognised source files are treated as
+# incidental — a build script, a single .py tool in a C# repository — rather
+# than as part of the project.
+MINOR_LANGUAGE_SHARE = 0.05
+
+
+def detect_languages(root: Path) -> list[tuple[str, int]]:
+    """
+    Every language worth serving in this repository, most significant first.
+
+    Ordered by file count, then by SolidLSP's own priority, which exists to
+    break exactly this tie: Vue and Svelte are supersets of TypeScript and rank
+    below it so that the larger language only wins when it matches more
+    strongly.
+
+    Returns pairs of (language, file count). Empty if nothing was recognised.
+    """
     counts: Counter[str] = Counter()
-    for dirpath, dirnames, filenames in os.walk(root):
+    for _dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = walkable(dirnames)
         for name in filenames:
             language = EXTENSION_LANGUAGES.get(Path(name).suffix)
             if language:
                 counts[language] += 1
     if not counts:
+        return []
+
+    total = sum(counts.values())
+    priority = {lid.value: lid.get_priority() for lid in DETECTED_LANGUAGES}
+    ranked = sorted(
+        counts.items(),
+        key=lambda item: (item[1], priority.get(item[0], 0)),
+        reverse=True,
+    )
+    # The majority language is always served, however lopsided the split; the
+    # rest have to clear the noise floor.
+    keep = [ranked[0]]
+    keep += [(lang, n) for lang, n in ranked[1:] if n / total >= MINOR_LANGUAGE_SHARE]
+    return keep[:MAX_LANGUAGES]
+
+
+def detect_language(root: Path) -> str:
+    """The single most significant language. Raises if nothing is recognised."""
+    found = detect_languages(root)
+    if not found:
         raise RuntimeError(f"no recognized source files under {root}")
-    language, count = counts.most_common(1)[0]
-    log(f"detected language: {language} ({count} files)")
-    return language
+    return found[0][0]
 
 
 class LanguageServerSession:
@@ -382,6 +436,64 @@ class LanguageServerSession:
                     log(f"shutdown error: {exc}")
                 self._context = None
                 self._server = None
+
+
+class LanguageServerPool:
+    """
+    One repository, one language server per language it actually contains.
+
+    A repository is rarely one language. Serving only the majority one means a
+    question about the frontend of a .NET solution returns nothing, which is
+    indistinguishable from the symbol not existing — the answer this project
+    treats as never trustworthy.
+
+    Servers are started individually and only when something needs them. A
+    language server is hundreds of megabytes and tens of seconds; starting one
+    per detected language up front would spend both on languages nobody asks
+    about. So detection decides what *may* be served, and the first question
+    that needs a given language decides whether it actually starts.
+    """
+
+    def __init__(self, root: Path, languages: list[str]) -> None:
+        self.root = root
+        self.languages = languages
+        self._sessions: dict[str, LanguageServerSession] = {}
+        self._lock = threading.Lock()
+
+    def session(self, language: str) -> LanguageServerSession:
+        with self._lock:
+            if language not in self._sessions:
+                self._sessions[language] = LanguageServerSession(self.root, language)
+            return self._sessions[language]
+
+    def started(self) -> list[str]:
+        return [lang for lang, s in self._sessions.items() if s._server is not None]
+
+    def language_for_file(self, target: str) -> str | None:
+        """Which of our languages owns this file, by extension."""
+        language = EXTENSION_LANGUAGES.get(Path(target).suffix)
+        return language if language in self.languages else None
+
+    def ordered(self, preferred: str | None = None) -> list[LanguageServerSession]:
+        """
+        Sessions to try, most likely first.
+
+        Already-running servers come before cold ones: if two languages could
+        answer, asking the one that is already warm costs nothing, while
+        starting the other costs a download.
+        """
+        order = list(self.languages)
+        if preferred and preferred in order:
+            order.remove(preferred)
+            order.insert(0, preferred)
+        else:
+            running = self.started()
+            order.sort(key=lambda lang: lang not in running)
+        return [self.session(lang) for lang in order]
+
+    def shutdown(self) -> None:
+        for session in self._sessions.values():
+            session.shutdown()
 
 
 _ROOT: Path | None = None
@@ -1277,7 +1389,72 @@ def send(message: dict) -> None:
     sys.stdout.flush()
 
 
-def serve(session: LanguageServerSession) -> None:
+def dispatch(pool: LanguageServerPool, tool: str, args: dict) -> str:
+    """
+    Route one tool call to the language server that can answer it.
+
+    Three cases, in order of how much they can be decided up front:
+
+    `project_info` describes the binding itself, so it never touches a server
+    and reports every language rather than one.
+
+    A tool naming a `file` is decided by that file's extension. Guessing is not
+    needed and would be wrong: asking Roslyn about a .ts file produces a
+    confusing error rather than an answer.
+
+    A tool naming a symbol could be answered by any of them, so they are tried
+    in turn and the first real answer wins. Cross-language references do not
+    exist at the language-server level — a C# symbol has no TypeScript
+    references — so the first language that resolves a name is the one that
+    owns it. Trying in order, warm servers first, also means a repository with
+    four languages does not start four servers to answer one question.
+    """
+    if tool == "project_info":
+        return describe_pool(pool)
+
+    target = args.get("file")
+    if target:
+        language = pool.language_for_file(repo_file(target))
+        if language is None:
+            known = ", ".join(pool.languages)
+            raise ToolError(
+                f"{target!r} is not a file this server handles. It serves "
+                f"{known} in {pool.root}. A file of another language needs a "
+                "server bound to that language."
+            )
+        return call_tool(pool.session(language), tool, args)
+
+    # Symbol-named tools. Keep the first genuine failure to report if nobody
+    # can answer, rather than the last, which is usually the least relevant
+    # language's complaint.
+    first_error: ToolError | None = None
+    for session in pool.ordered():
+        try:
+            return call_tool(session, tool, args)
+        except ToolError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+    raise first_error or ToolError(f"no language server could answer {tool}")
+
+
+def describe_pool(pool: LanguageServerPool) -> str:
+    """project_info across every language this repository serves."""
+    running = pool.started()
+    rows = [
+        f"repository    : {pool.root}",
+        f"languages     : {', '.join(pool.languages)}",
+        f"running       : {', '.join(running) if running else 'none started yet'}",
+        f"servers       : {solidlsp_home()}",
+        "",
+        "One server process, one repository, and a language server per language "
+        "it contains. Each starts on the first question that needs it, so a "
+        "language listed but not running has simply not been asked about.",
+    ]
+    return "\n".join(rows)
+
+
+def serve(pool: LanguageServerPool) -> None:
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -1311,7 +1488,7 @@ def serve(session: LanguageServerSession) -> None:
             tool_name = params.get("name", "")
             arguments = params.get("arguments") or {}
             try:
-                text = call_tool(session, tool_name, arguments)
+                text = dispatch(pool, tool_name, arguments)
                 is_error = False
             except ToolError as exc:
                 text, is_error = str(exc), True
@@ -1344,33 +1521,33 @@ def server_instructions() -> str:
     discovered by a confusing empty answer.
     """
     root = _ROOT or Path.cwd()
-    detected = ", ".join(sorted(set(EXTENSION_LANGUAGES.values())))
     return (
-        f"Lodesman answers questions about code using a real language server, "
-        f"so results come from the compiler's understanding rather than a text "
-        f"search. This server instance is bound to {root} and serves it alone.\n\n"
-        "One server, one repository, one language, fixed at startup. There is no "
-        "tool to change any of them; a different repository or language needs "
-        "another server entry in the MCP configuration.\n\n"
-        f"Auto-detected languages: {detected}. Detection counts source files "
-        "under the root and takes the majority, so a repository holding two "
-        "languages will bind to whichever has more files and answer nothing "
-        "useful about the other.\n\n"
-        "If a query about code you can see in the repository returns nothing, "
-        "suspect the configuration before you conclude the symbol is unused. "
-        "Call project_info to see what this server actually bound to. The usual "
-        "fix is a per-project MCP entry pointing at the right folder, for "
-        "example a backend and a frontend served separately:\n"
-        '  {"mcpServers": {\n'
-        '     "lodesman-backend":  {"command": "uvx",\n'
-        '        "args": ["lodesman-mcp", "backend", "--language", "csharp"]},\n'
-        '     "lodesman-frontend": {"command": "uvx",\n'
-        '        "args": ["lodesman-mcp", "frontend", "--language", "typescript"]}}}\n'
-        "Relative paths resolve against the directory the client launches in. "
-        "Prefer binding each server to the folder that holds that language's "
-        "project rather than to a shared root: some language servers pick up "
-        "sibling projects from a parent directory and some load only one, and "
-        "the failure looks identical to a symbol having no references."
+        "Lodesman answers questions about code using a real language server, so "
+        "results come from the compiler's understanding rather than a text "
+        f"search. This server is bound to {root} and serves it alone.\n\n"
+        "It serves every language the repository contains, not just the main "
+        "one: the languages are detected at startup and a language server is "
+        "started for each, individually, on the first question that needs it. "
+        "So a .NET solution with a TypeScript frontend is one server entry, not "
+        "two, and questions about either half work without configuration.\n\n"
+        "Call project_info to see which languages this repository was found to "
+        "contain and which of their servers are running. A language listed but "
+        "not running has simply not been asked about yet; the first question "
+        "starts it, which for a cold language server can take a while.\n\n"
+        "Tools naming a file are answered by the server for that file's "
+        "language. Tools naming a symbol are tried against each language in "
+        "turn, so a symbol is found whichever half of the repository it lives "
+        "in.\n\n"
+        "The repository is fixed at startup and no tool changes it. A different "
+        "repository needs another entry in the MCP configuration. Relative "
+        "paths in that entry resolve against the directory the client launches "
+        "in.\n\n"
+        "If a question about code you can see returns nothing, check "
+        "project_info before concluding the symbol is unused: the usual cause "
+        "is that this server is bound to a different directory than you expect. "
+        "Detection covers far more languages than have been verified, so an "
+        "unverified language may answer partially or not at all — that is not "
+        "the same as the symbol being absent, and the difference matters."
     )
 
 
@@ -1393,24 +1570,35 @@ def main() -> int:
         return 2
 
     globals()["_ROOT"] = root
+
+    if args.language:
+        # An explicit language is an instruction, not a hint: serve that and
+        # nothing else, even if the repository contains more.
+        languages = [args.language]
+        log(f"language forced: {args.language}")
+    else:
+        detected = detect_languages(root)
+        if not detected:
+            # An MCP client renders a traceback as "failed to connect", which
+            # tells the user nothing about what to change. Match how the
+            # not-a-directory case already reports itself.
+            log(f"no recognized source files under {root}")
+            log("Pass --language to force one, or start the server in a "
+                "repository that contains source files.")
+            return 2
+        languages = [language for language, _ in detected]
+        summary = ", ".join(f"{language} ({n} files)" for language, n in detected)
+        log(f"detected: {summary}")
+
+    pool = LanguageServerPool(root, languages)
+    log(f"ready — repo={root} languages={', '.join(languages)} "
+        "(each language server starts on the first question that needs it)")
     try:
-        language = args.language or detect_language(root)
-    except RuntimeError as exc:
-        # An MCP client renders a traceback as "failed to connect", which tells
-        # the user nothing about what to change. Match how the not-a-directory
-        # case already reports itself.
-        log(str(exc))
-        log("Pass --language to force one, or start the server in a repository "
-            "that contains source files.")
-        return 2
-    session = LanguageServerSession(root, language)
-    log(f"ready — repo={root} language={language} (server starts on first tool call)")
-    try:
-        serve(session)
+        serve(pool)
     except KeyboardInterrupt:
         pass
     finally:
-        session.shutdown()
+        pool.shutdown()
     return 0
 
 

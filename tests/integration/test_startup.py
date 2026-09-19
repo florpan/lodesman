@@ -68,7 +68,9 @@ class TestToolSurface(IntegrationCase):
         self.assertTrue(instructions, "initialize carried no instructions")
         self.assertIn(str(self.repos["py_lf"]), instructions)
         self.assertIn("project_info", instructions)
-        self.assertIn("--language", instructions)
+        # It has to say that several languages are served and that servers start
+        # lazily, or an agent will read a slow first call as a hang.
+        self.assertIn("every language the repository contains", instructions)
 
     def test_project_info_reports_the_bound_repository(self):
         with Server(self.repos["py_lf"], language="python") as server:
@@ -82,7 +84,7 @@ class TestLanguageDetection(IntegrationCase):
         # 130 .py files under .tox/.mypy_cache/.direnv, one real src/app.ts.
         # 0.3.0 reported "python (130 files)" here.
         with Server(self.repos["hidden"]) as server:
-            line = self.stderr_line(server, "detected language")
+            line = self.stderr_line(server, "detected:")
             self.assertIn("typescript", line)
             self.assertNotIn("python", line)
 

@@ -68,7 +68,7 @@ every project — no per-project configuration.
 To point it somewhere explicitly:
 
 ```bash
-lodesman-mcp /path/to/repo --language csharp
+lodesman-mcp /path/to/repo
 ```
 
 ### First run
@@ -123,23 +123,31 @@ matters more to an agent than to a person.
 
 ## Configuring it
 
-**One server serves one repository, in one language, fixed at startup.** Nothing
-changes that at runtime — not a tool call, not the agent. A second repository or
-a second language means a second entry in your MCP configuration. That one
-sentence answers most of the questions people have about how to set this up.
-
-### A single-language project
-
-Put it in your user configuration once and it works everywhere, because with no
-path argument the server binds to whatever directory the client launches it in:
+**One entry, for everything.** One server serves one repository and every
+language that repository contains. A second *repository* needs a second entry; a
+second *language* does not.
 
 ```bash
 claude mcp add lodesman --scope user -- uvx lodesman-mcp
 ```
 
-The language is detected by counting source files under the root and taking the
-majority. Auto-detected: **C#, TypeScript/JavaScript, Python, Go, Rust, Java,
-Kotlin, Ruby, PHP, Swift, C/C++**.
+That is the whole setup, and it works in every project, because with no path
+argument the server binds to whatever directory the client launches it in.
+
+At startup it counts source files to work out which languages the repository
+actually contains, and starts a language server for each one **individually, on
+the first question that needs it**. A language server costs hundreds of megabytes
+and tens of seconds, so a repository containing four languages does not pay for
+four of them to answer one question about one.
+
+Detection covers 51 languages — everything SolidLSP supports, minus the
+experimental servers and the ones with no real symbol structure (markdown, JSON,
+YAML). That is deliberately wider than the set verified in CI below: trying an
+untested language is strictly better than refusing to start, which is what the
+old hand-written list did to ordinary React projects written in `.jsx`.
+
+`project_info` reports which languages were found and which of their servers are
+running. A language listed but not running has simply not been asked about.
 
 ### React, Vue, Svelte, Angular
 
@@ -156,92 +164,58 @@ lodesman-mcp frontend --language typescript   # React, plain TS, or both
 
 Vue and Svelte are genuinely different, because `.vue` and `.svelte` are
 single-file-component formats that are not valid TypeScript. They have their own
-servers — and those servers are **supersets**, not alternatives: the Vue server
-handles `.vue` *and* `.ts`/`.js`, Svelte handles `.svelte` *and* `.ts`, Angular
-handles `.ts`/`.tsx` *and* `.html`. So there is still one server for the
-frontend, just a different one:
+servers, and those servers are **supersets** rather than alternatives: the Vue
+server handles `.vue` *and* `.ts`/`.js`, Svelte handles `.svelte` *and* `.ts`.
 
-```bash
-lodesman-mcp frontend --language vue          # .vue and .ts together
-```
+Detection knows this. SolidLSP ranks Vue and Svelte below TypeScript precisely
+because they are supersets, so a `.ts` file counts towards TypeScript while a
+`.vue` file counts towards Vue — and a project with both gets both servers,
+without either stealing the other's files.
 
-Those three are not auto-detected yet and are untested here, so they need naming
-explicitly. See below.
-
-### A language it does not auto-detect
-
-SolidLSP ships servers for far more languages than the eleven above. Any of them
-can be used by naming it — there is just no detection for it, so it has to be
-explicit:
-
-```bash
-lodesman-mcp . --language elixir
-```
+Neither is verified in CI yet, so treat them as untested rather than supported.
 
 ### A repository with more than one language
 
-This is the common case — a backend and a frontend in one repo — and detection
-handles it badly on purpose: it picks the majority language and then knows
-nothing about the other. Give each one its own server, in a **project-scoped**
-`.mcp.json` committed alongside the code:
-
-```json
-{
-  "mcpServers": {
-    "lodesman-backend": {
-      "command": "uvx",
-      "args": ["lodesman-mcp", "backend", "--language", "csharp"]
-    },
-    "lodesman-frontend": {
-      "command": "uvx",
-      "args": ["lodesman-mcp", "frontend", "--language", "typescript"]
-    }
-  }
-}
-```
-
-Paths are relative to the directory the client launches in, so this file is
-portable between machines. MCP namespaces tools per server, so the agent sees
-`lodesman-backend`'s tools and `lodesman-frontend`'s tools as distinct and picks
-by name — which also makes the choice legible in a transcript.
-
-### A .NET solution with a JavaScript frontend
-
-The most common shape in practice: a `.sln` with several C# projects, and a
-`frontend/` beside them. One server covers the whole solution, a second covers
-the frontend.
+Nothing to configure. A .NET solution with a React frontend, a Python service
+with a TypeScript dashboard, a Go backend with a Vue admin panel — one entry
+covers all of it.
 
 ```
 solution/
   Solution.sln
   Web/            C#     ─┐
-  Core/           C#      ├─ one server, rooted at solution/
-  Infrastructure/ C#     ─┘
-  frontend/       React + TypeScript  ── a second, rooted at solution/frontend
+  Core/           C#      ├─ one server process, one MCP entry
+  Infrastructure/ C#      │
+  frontend/       React  ─┘
 ```
 
-```json
-{
-  "mcpServers": {
-    "lodesman-backend": {
-      "command": "uvx",
-      "args": ["lodesman-mcp", ".", "--language", "csharp"]
-    },
-    "lodesman-frontend": {
-      "command": "uvx",
-      "args": ["lodesman-mcp", "frontend", "--language", "typescript"]
-    }
-  }
-}
+Measured on exactly that layout: `project_info` reports `csharp, typescript`,
+questions about the C# projects are answered by Roslyn, and questions about the
+frontend by tsserver — in the same process, each started only once something
+asks for it.
+
+Routing is by the question, not by guesswork:
+
+- A tool naming a **file** goes to the server for that file's language. Asking
+  Roslyn about a `.ts` file would produce a confusing error rather than an
+  answer, so it is never asked.
+- A tool naming a **symbol** is tried against each language in turn, so a symbol
+  is found whichever half of the repository it lives in. Cross-language
+  references do not exist at the language-server level — a C# symbol has no
+  TypeScript references — so the first language that resolves a name owns it.
+
+Warm servers are tried before cold ones, so answering a second question about a
+language already in use costs nothing extra.
+
+### Forcing a single language
+
+`--language` overrides detection entirely and serves that language alone. Useful
+when a repository contains something you specifically do not want a server
+started for, or to name a language detection does not recognise:
+
+```bash
+lodesman-mcp . --language elixir
 ```
-
-Measured on exactly that layout: the backend server resolved symbols in all
-three C# projects, and the frontend server resolved the TypeScript. Roslyn loads
-the whole solution from the root, so adding a fourth C# project needs no config
-change.
-
-`--language csharp` is load-bearing. Without it, detection counts source files,
-C# wins on volume, and the frontend gets no coverage at all — silently.
 
 ### Several projects in the same language
 
