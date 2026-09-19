@@ -77,7 +77,7 @@ jobs:
       # ruby-lsp is a gem; the runner's Ruby does not include it.
       - name: Install ruby-lsp
         if: matrix.language == 'ruby'
-        run: gem install ruby-lsp
+        run: sudo gem install ruby-lsp
 
       - name: Install kotlin-language-server
         if: matrix.language == 'kotlin'

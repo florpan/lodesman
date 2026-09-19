@@ -27,6 +27,7 @@ a toolchain being on PATH does not mean the server works.
 from __future__ import annotations
 
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,10 +57,33 @@ class LanguageSpec:
     the one failure mode an agent cannot recover from.
     """
 
+    prebuild: tuple[str, ...] = ()
+    """
+    A command to run in the fixture before starting the language server.
+
+    Most servers parse source directly. sourcekit-lsp does not: it answers from
+    a compiled index store, so without a build it reports no symbol named
+    'Record' in a file that plainly declares one. Building is part of setting
+    that language up, not a workaround.
+    """
+
     notes: str = ""
 
     def missing_tools(self) -> list[str]:
         return [tool for tool in self.requires if shutil.which(tool) is None]
+
+    def prepare(self, repo: Path) -> str | None:
+        """Run the prebuild, if any. Returns an error description on failure."""
+        if not self.prebuild:
+            return None
+        try:
+            done = subprocess.run(self.prebuild, cwd=repo, capture_output=True,
+                                  text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"{' '.join(self.prebuild)}: {exc}"
+        if done.returncode != 0:
+            return f"{' '.join(self.prebuild)} exited {done.returncode}: {done.stderr[-300:]}"
+        return None
 
     def build(self, dest: Path) -> Path:
         for relative, content in self.files.items():
@@ -737,6 +761,11 @@ SWIFT = LanguageSpec(
     language="swift",
     outline_file="Sources/Fixture/Store.swift",
     requires=("swift",),
+    prebuild=("swift", "build"),
+    notes=(
+        "sourcekit-lsp answers from a compiled index store, so the package must "
+        "be built before symbols resolve."
+    ),
     files={
         "Package.swift": (
             "// swift-tools-version:5.7\n"

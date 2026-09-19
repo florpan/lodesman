@@ -68,6 +68,9 @@ class LanguageContract:
         tmp = tempfile.TemporaryDirectory(prefix=f"lodesman-{cls.spec.language}-")
         cls.addClassCleanup(tmp.cleanup)
         cls.repo = cls.spec.build(Path(tmp.name).resolve() / "repo")
+        failure = cls.spec.prepare(cls.repo)
+        if failure:
+            raise unittest.SkipTest(f"{cls.spec.language}: prebuild failed: {failure}")
 
         cls.server = Server(cls.repo, language=cls.spec.language)
         cls.addClassCleanup(cls.server.close)
@@ -83,12 +86,32 @@ class LanguageContract:
         tmp = tempfile.TemporaryDirectory(prefix=f"lodesman-{self.spec.language}-rw-")
         self.addCleanup(tmp.cleanup)
         repo = self.spec.build(Path(tmp.name).resolve() / "repo")
+        failure = self.spec.prepare(repo)
+        if failure:
+            self.skipTest(f"{self.spec.language}: prebuild failed: {failure}")
         server = Server(repo, language=self.spec.language)
         self.addCleanup(server.close)
         server.initialize()
         if not server.language_server_ready():
             self.skipTest(f"{self.spec.language}: language server did not start")
         return repo, server
+
+    def snapshot(self, repo: Path) -> dict[str, bytes]:
+        """
+        The bytes of the fixture's own files, and nothing else.
+
+        Deliberately not repo.rglob("*"): a language server may write inside
+        the repository it is given — sourcekit-lsp builds an index there — and
+        those artefacts appear in an "after" snapshot but not a "before" one.
+        That produced a KeyError and a line-ending count mismatch on a fixture
+        with no CRLF in it at all, which is a test measuring the wrong files
+        rather than a rename misbehaving.
+        """
+        return {
+            relative: (repo / relative).read_bytes()
+            for relative in self.spec.files
+            if (repo / relative).is_file()
+        }
 
     def call(self, tool: str, **arguments) -> str:
         text, is_error = self.server.call(tool, arguments)
@@ -141,7 +164,7 @@ class LanguageContract:
         # tests share a warm server that must not see the fixture change
         # underneath them.
         repo, server = self.fresh_server()
-        before = {p: p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+        before = self.snapshot(repo)
 
         text, is_error = server.call(
             "rename_symbol",
@@ -154,20 +177,20 @@ class LanguageContract:
             # exactly the bug 0.3.0 shipped with.
             self.assertTrue(is_error, f"expected a refusal, got: {text[:200]}")
             self.assertNotIn("Written:", text)
-            after = {p: p.read_bytes() for p in repo.rglob("*") if p.is_file()}
-            self.assertEqual(after, before, "refused the rename but wrote anyway")
+            self.assertEqual(self.snapshot(repo), before,
+                             "refused the rename but wrote anyway")
             return
 
         self.assertFalse(is_error, text)
         self.assertIn("Written:", text)
 
-        after = {p: p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+        after = self.snapshot(repo)
         changed = [p for p in before if after.get(p) != before[p]]
         self.assertTrue(changed, "rename reported success but nothing changed on disk")
         self.assertIn(b"VoidStore", b"".join(after.values()))
 
         for path, raw in after.items():
-            with self.subTest(file=path.name):
+            with self.subTest(file=path):
                 self.assertEqual(raw.count(CRLF), before[path].count(CRLF))
                 self.assertEqual(raw.count(LF) - raw.count(CRLF),
                                  before[path].count(LF) - before[path].count(CRLF))
