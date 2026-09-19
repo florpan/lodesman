@@ -178,23 +178,55 @@ portable between machines. MCP namespaces tools per server, so the agent sees
 `lodesman-backend`'s tools and `lodesman-frontend`'s tools as distinct and picks
 by name — which also makes the choice legible in a transcript.
 
+### A .NET solution with a JavaScript frontend
+
+The most common shape in practice: a `.sln` with several C# projects, and a
+`frontend/` beside them. One server covers the whole solution, a second covers
+the frontend.
+
+```
+solution/
+  Solution.sln
+  Web/            C#     ─┐
+  Core/           C#      ├─ one server, rooted at solution/
+  Infrastructure/ C#     ─┘
+  frontend/       React + TypeScript  ── a second, rooted at solution/frontend
+```
+
+```json
+{
+  "mcpServers": {
+    "lodesman-backend": {
+      "command": "uvx",
+      "args": ["lodesman-mcp", ".", "--language", "csharp"]
+    },
+    "lodesman-frontend": {
+      "command": "uvx",
+      "args": ["lodesman-mcp", "frontend", "--language", "typescript"]
+    }
+  }
+}
+```
+
+Measured on exactly that layout: the backend server resolved symbols in all
+three C# projects, and the frontend server resolved the TypeScript. Roslyn loads
+the whole solution from the root, so adding a fourth C# project needs no config
+change.
+
+`--language csharp` is load-bearing. Without it, detection counts source files,
+C# wins on volume, and the frontend gets no coverage at all — silently.
+
 ### Several projects in the same language
 
-Binding one server to a shared parent sometimes works and sometimes quietly
-under-reports, and it depends on the language server rather than on Lodesman.
-Measured on a repository holding two C# projects and two TypeScript projects in
-sibling folders, each server rooted at the repository root:
+Whether one server can cover a shared parent depends on the language server, not
+on Lodesman. Roslyn loads sibling projects from a parent directory; tsserver
+loads only the project it was anchored in, so a server rooted above two
+TypeScript projects reported symbols from one of them and nothing from the other.
 
-| | result |
-|---|---|
-| C# | found symbols in **both** projects — Roslyn loads siblings |
-| TypeScript | found **one** — tsserver loaded only the project it was anchored in |
-
-So the reliable configuration is **one server per project root**, not one per
-language. Point servers at the folders that actually contain the projects. A
-shared root may work for your language, but when it does not, the symptom is an
-empty answer that looks exactly like a symbol having no references — which is
-the one result you should never take at face value.
+So: **one server per project root** is the configuration that always works.
+A shared root may work for your language, and when it does not, the symptom is
+an empty answer indistinguishable from a symbol genuinely having no references —
+the one result never to take at face value.
 
 Agents get a condensed version of all of this automatically: it is sent in the
 MCP `initialize` response, so a coding agent can diagnose a misconfiguration and
