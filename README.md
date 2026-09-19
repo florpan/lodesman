@@ -168,7 +168,36 @@ Fixed in 0.3.1:
 ```bash
 git clone https://github.com/florpan/lodesman
 cd lodesman
-python -m unittest discover tests        # fast, no language server needed
+python -m unittest discover -t . -s tests
+```
+
+That runs the unit tests and the integration tests that need no language
+server — startup, language detection, the tool surface, and path containment,
+which is enforced before any language server is contacted. A couple of seconds,
+no downloads.
+
+The rename tests drive a real language server and are opt-in, because a cold
+machine has to download one first:
+
+```bash
+LODESMAN_INTEGRATION=1 python -m unittest discover -t . -s tests
+```
+
+They skip rather than fail if no working language server is available. To run
+them against a published release instead of the working tree:
+
+```bash
+LODESMAN_PKG=lodesman-mcp@0.3.1 UVX_FLAGS=--refresh \
+  LODESMAN_INTEGRATION=1 python -m unittest discover -t . -s tests
+```
+
+`UVX_FLAGS` is separate because uv's own flags must precede the package name —
+anything after it is forwarded to `lodesman-mcp` and rejected by its argument
+parser.
+
+There is also a standalone check against a repository of your own:
+
+```bash
 python scripts/smoke_test.py <repo> --language csharp
 ```
 
