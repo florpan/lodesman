@@ -121,7 +121,8 @@ class Server:
 
     # -- lifecycle --------------------------------------------------------
 
-    def language_server_ready(self, timeout: float = 600, settle: float = 90) -> bool:
+    def language_server_ready(self, timeout: float = 600, settle: float = 90,
+                              symbols: tuple[str, ...] = ("Store",)) -> bool:
         """
         Whether the language server is actually answering questions yet.
 
@@ -134,19 +135,32 @@ class Server:
         query succeeded in a later test. A probe that tolerates a failed answer
         is not a readiness check.
 
-        So it polls until the server resolves a symbol the fixtures all define,
-        then gives up. Returning False rather than raising is deliberate: a
-        machine without a working server should skip these tests, not fail them.
+        It polls until every symbol in `symbols` resolves. Every one, because a
+        workspace index does not necessarily populate atomically: sourcekit-lsp
+        resolved Store while Record was still missing, so a probe for one
+        symbol declared the server ready and the very next test asked about the
+        other and got nothing. Callers pass the symbols their assertions
+        actually depend on.
+
+        Returning False rather than raising is deliberate: a machine without a
+        working server should skip these tests, not fail them.
         """
         deadline = time.time() + settle
         while True:
-            try:
-                text, is_error = self.call("find_symbol", {"name": "Store"}, timeout=timeout)
-            except (ServerError, TimeoutError):
-                return False
-            if not is_error and "Store" in text:
+            missing: list[str] = []
+            for symbol in symbols:
+                try:
+                    text, is_error = self.call(
+                        "find_symbol", {"name": symbol}, timeout=timeout
+                    )
+                except (ServerError, TimeoutError):
+                    return False
+                if is_error or symbol not in text:
+                    missing.append(symbol)
+            if not missing:
                 return any(READY_MARKER in line for line in self.stderr)
             if time.time() >= deadline:
+                self.stderr.append(f"[harness] never resolved: {', '.join(missing)}")
                 return False
             time.sleep(2)
 

@@ -35,6 +35,13 @@ SKIP_REASON = "set LODESMAN_INTEGRATION=1 to run (needs language servers)"
 CRLF = b"\r\n"
 LF = b"\n"
 
+# Every symbol the contract asserts on. Readiness waits for all of them,
+# because a workspace index does not necessarily populate atomically:
+# sourcekit-lsp resolved Store while Record was still missing, so probing one
+# symbol declared the server ready and the next test asked about the other and
+# got nothing back.
+CONTRACT_SYMBOLS = ("Record", "Store", "NullStore")
+
 
 class LanguageContract:
     """
@@ -75,7 +82,7 @@ class LanguageContract:
         cls.server = Server(cls.repo, language=cls.spec.language)
         cls.addClassCleanup(cls.server.close)
         cls.server.initialize()
-        if not cls.server.language_server_ready():
+        if not cls.server.language_server_ready(symbols=CONTRACT_SYMBOLS):
             raise unittest.SkipTest(
                 f"{cls.spec.language}: language server did not start. "
                 + " | ".join(cls.server.stderr[-4:])
@@ -92,7 +99,7 @@ class LanguageContract:
         server = Server(repo, language=self.spec.language)
         self.addCleanup(server.close)
         server.initialize()
-        if not server.language_server_ready():
+        if not server.language_server_ready(symbols=CONTRACT_SYMBOLS):
             self.skipTest(f"{self.spec.language}: language server did not start")
         return repo, server
 
