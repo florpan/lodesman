@@ -32,6 +32,21 @@ Where a server lacks one, the tool falls back, and the answer says so.
 - **`type_hierarchy`, subtypes:** uses `textDocument/implementation`.
 - **`type_hierarchy`, supertypes:** shows the declaration line as written.
 
+### Java methods can be found by name
+
+Name lookups found Java classes but never methods. `find_references`,
+`call_hierarchy` and the other tools that take a name answered "no symbol
+named 'fromJson'". jdtls leaves methods out of its workspace symbol search by
+default (`java.symbols.includeSourceMethodDeclarations: false`). Lodesman now
+turns the setting on.
+
+The cost, measured on gson (264 files): startup went from 14.7 to 15.5
+seconds and memory rose 4–6%. Distinctive names like `fromJson` stay instant.
+Common names get expensive: `get` returns 1,743 symbols and takes 1.1 seconds,
+and that likely grows with project size. This is the likeliest reason for the
+default. It can be switched back off with one constant,
+`JAVA_METHODS_IN_SYMBOL_SEARCH`.
+
 ### `check` said "no errors" about broken C# in a fresh clone
 
 On a project that had never been built, `check` answered **"no errors"** for a

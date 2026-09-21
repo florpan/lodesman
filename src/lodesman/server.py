@@ -295,6 +295,39 @@ def detect_language(root: Path) -> str:
     return found[0][0]
 
 
+# jdtls leaves methods out of workspace/symbol unless told otherwise, so no
+# Java method could be named: "fromJson" found nothing in gson. False is
+# jdtls's own default, which SolidLSP copies. Measured on gson (264 files):
+# startup 14.7s -> 15.5s, memory +4-6%, and a distinctive method name costs
+# nothing — but a common one does: "get" returns 1743 symbols in 1.1s. The
+# likeliest reason for the default. Set False to back off.
+JAVA_METHODS_IN_SYMBOL_SEARCH = True
+
+
+def include_java_methods(server: SolidLanguageServer) -> None:
+    """
+    Make jdtls index method declarations for workspace/symbol.
+
+    Wraps this one instance's initialize parameters rather than editing the
+    vendored tree (workdocs/VENDORING.md, preference 2). Written against
+    SolidLSP at oraios/serena 704e8c3d. If that method is renamed, or the settings are
+    reshaped, this logs and leaves jdtls at its default: Java methods then
+    cannot be found by name, which is how it was before this was written.
+    """
+    build = server._create_initialize_params
+
+    def with_methods():
+        params = build()
+        try:
+            java = params["initializationOptions"]["settings"]["java"]
+            java.setdefault("symbols", {})["includeSourceMethodDeclarations"] = True
+        except (KeyError, TypeError) as exc:
+            log(f"could not enable Java method search (jdtls default kept): {exc!r}")
+        return params
+
+    server._create_initialize_params = with_methods
+
+
 class LanguageServerSession:
     """Owns one language server, started on demand and kept warm."""
 
@@ -328,6 +361,8 @@ class LanguageServerSession:
                 server = SolidLanguageServer.create(
                     config, str(self.root), timeout=600, solidlsp_settings=settings
                 )
+                if self.language == "java" and JAVA_METHODS_IN_SYMBOL_SEARCH:
+                    include_java_methods(server)
                 self._context = server.start_server_context()
                 self._context.__enter__()
                 server.server.on_any_notification(self._observe)
