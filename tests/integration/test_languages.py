@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -209,6 +210,57 @@ class LanguageContract:
                 self.assertEqual(raw.count(CRLF), before[path].count(CRLF))
                 self.assertEqual(raw.count(LF) - raw.count(CRLF),
                                  before[path].count(LF) - before[path].count(CRLF))
+
+    # -- staying in sync with the disk -------------------------------------
+
+    def resolves(self, server: Server, name: str, timeout: float = 30) -> bool:
+        """
+        Whether find_symbol reports `name` within `timeout` seconds.
+
+        Polls rather than asking once: a server that was told about a change
+        reindexes asynchronously, and the property under test is that it
+        catches up, not that it does so before the next request arrives. A
+        server that was never told stays wrong for the whole window.
+        """
+        deadline = time.time() + timeout
+        while True:
+            text, is_error = server.call("find_symbol", {"name": name})
+            if not is_error and f"No symbol matching {name!r}" not in text:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(1)
+
+    def test_sees_files_edited_on_disk(self):
+        # What an agent does with its own Edit tool: change files the language
+        # server has no reason to have open. Every server config advertises
+        # didChangeWatchedFiles, which tells the server the client watches the
+        # disk on its behalf — so if lodesman does not, the server keeps
+        # answering from the version it indexed at startup.
+        repo, server = self.fresh_server()
+        for relative in self.spec.files:
+            path = repo / relative
+            raw = path.read_bytes()
+            if b"NullStore" in raw:
+                path.write_bytes(raw.replace(b"NullStore", b"VoidStore"))
+
+        self.assertTrue(self.resolves(server, "VoidStore"),
+                        "a type added on disk never became visible")
+
+    def test_sees_its_own_rename(self):
+        # rename_symbol writes the files itself. A second question straight
+        # after must be answered from what was written, or a follow-up rename
+        # computes its edits against positions that no longer exist.
+        if not self.spec.supports_rename:
+            self.skipTest(f"{self.spec.language}: server does not rename")
+        repo, server = self.fresh_server()
+        text, is_error = server.call(
+            "rename_symbol",
+            {"name": "NullStore", "new_name": "VoidStore", "apply": True},
+        )
+        self.assertFalse(is_error, text)
+        self.assertTrue(self.resolves(server, "VoidStore"),
+                        "the renamed symbol never became visible to the server")
 
 
 def _make_case(spec: languages.LanguageSpec) -> type[unittest.TestCase]:

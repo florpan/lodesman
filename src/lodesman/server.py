@@ -121,6 +121,62 @@ def walkable(dirnames: list[str]) -> list[str]:
     return [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
 
 
+DiskState = dict[str, tuple[int, int]]
+
+# LSP FileChangeType.
+FILE_CREATED, FILE_CHANGED, FILE_DELETED = 1, 2, 3
+
+
+def scan_sources(root: Path, language: str) -> DiskState:
+    """
+    Modification time and size of every source file of `language` under `root`.
+
+    Keyed by absolute path. os.scandir rather than os.walk plus a stat per file:
+    on Windows a DirEntry carries its stat from the directory listing, so this
+    costs one system call per directory rather than one per file, and it runs
+    before every tool call.
+    """
+    state: DiskState = {}
+    pending = [str(root)]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue  # vanished or unreadable mid-scan: its files read as deleted
+        subdirs = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
+        pending += [os.path.join(directory, name) for name in walkable(subdirs)]
+        for entry in entries:
+            if EXTENSION_LANGUAGES.get(os.path.splitext(entry.name)[1]) != language:
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            state[entry.path] = (stat.st_mtime_ns, stat.st_size)
+    return state
+
+
+def disk_changes(before: DiskState, after: DiskState) -> list[tuple[str, int]]:
+    """
+    What changed between two scans, as (absolute path, LSP FileChangeType).
+
+    Size is compared as well as mtime because a write inside the filesystem's
+    timestamp resolution leaves the mtime unchanged, and an edit that renames a
+    symbol almost always changes the length.
+    """
+    changes = [(path, FILE_DELETED) for path in before if path not in after]
+    for path, signature in after.items():
+        previous = before.get(path)
+        if previous is None:
+            changes.append((path, FILE_CREATED))
+        elif previous != signature:
+            changes.append((path, FILE_CHANGED))
+    return sorted(changes)
+
+
 def log(message: str) -> None:
     print(f"[{SERVER_NAME}] {message}", file=sys.stderr, flush=True)
 
@@ -219,6 +275,7 @@ class LanguageServerSession:
         self._server: SolidLanguageServer | None = None
         self._context = None
         self._anchors: list = []
+        self._disk: DiskState = {}
         self._lock = threading.Lock()
 
     @property
@@ -226,6 +283,10 @@ class LanguageServerSession:
         with self._lock:
             if self._server is None:
                 log(f"starting {self.language} language server at {self.root} …")
+                # Before the server reads anything, so an edit made while it
+                # indexes is reported by the first sync instead of being lost
+                # between the server's read and ours.
+                self._disk = scan_sources(self.root, self.language)
                 config = LanguageServerConfig(ls_id=LanguageServerId(self.language))
                 data_dir = project_data_dir(self.root)
                 data_dir.mkdir(parents=True, exist_ok=True)
@@ -343,6 +404,61 @@ class LanguageServerSession:
                 log("anchor indexing complete")
             except Exception as exc:  # noqa: BLE001
                 log(f"wait for anchor indexing failed: {exc}")
+
+    def sync_with_disk(self) -> int:
+        """
+        Tell the language server about every source file that changed on disk
+        since it last heard. Returns how many did.
+
+        Every server config SolidLSP ships declares the client capability
+        `didChangeWatchedFiles`, which tells the server the client watches the
+        disk on its behalf, so the server does not. Serena keeps that promise
+        with its own poller (LanguageServerManager.poll_and_notify), which is
+        outside the vendored tree, and until this nothing here kept it. Measured
+        before the fix: pyright never saw a file edited on disk nor our own
+        rename_symbol's writes, and Roslyn never saw a disk edit. tsserver was
+        fine only because it watches the disk itself whatever it is told.
+
+        This is what makes an agent's plain Edit tool safe to use alongside
+        this server: the next question re-syncs before it is asked.
+
+        Files the server holds open are different. For an open document the
+        editor's buffer is the truth, so servers ignore watcher events for it;
+        those get a didChange with the new contents instead, which SolidLSP's
+        file buffer sends when it sees the file's mtime move.
+        """
+        if self._server is None:
+            return 0  # starting the server scans; nothing to catch up on
+        started = time.perf_counter()
+        current = scan_sources(self.root, self.language)
+        elapsed = time.perf_counter() - started
+        # 40-120 ms on ordinary repositories, measured; seconds on a directory
+        # holding many of them. Said out loud, because it is paid on every call.
+        if elapsed > 0.5:
+            log(f"disk scan took {elapsed:.1f}s ({len(current)} files); every tool call pays this")
+        changes = disk_changes(self._disk, current)
+        self._disk = current
+        if not changes:
+            return 0
+
+        server = self._server
+        open_buffers = server.open_file_buffers
+        watched = []
+        for path, change in changes:
+            uri = Path(path).as_uri()
+            buffer = open_buffers.get(uri)
+            if buffer is not None and change != FILE_DELETED:
+                try:
+                    buffer.ensure_open_in_ls()
+                except Exception as exc:  # noqa: BLE001 — one file must not stop the rest
+                    log(f"could not resend open file {path}: {exc}")
+                continue
+            watched.append({"uri": uri, "type": change})
+
+        if watched:
+            server.server.notify.did_change_watched_files({"changes": watched})
+        log(f"synced {len(changes)} changed file(s) with the {self.language} server")
+        return len(changes)
 
     def settle(self, timeout: float = 15.0) -> None:
         """Re-run the readiness gate against the running server."""
@@ -1037,6 +1153,10 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             "its lifetime.",
         ])
 
+    # Every question is answered from what is on disk now, not from what was
+    # there when the server last looked.
+    session.sync_with_disk()
+
     if name == "find_symbol":
         query = args["name"]
         limit = int(args.get("limit", 25))
@@ -1382,6 +1502,9 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                     unchanged += 1
             except OSError as exc:
                 failed.append(f"  {path}: {exc}")
+        # Now rather than at the next call: the server reindexes asynchronously,
+        # and this gives it the time the agent spends reading this answer.
+        session.sync_with_disk()
 
         # Report what happened on disk, not what was attempted. The previous
         # implementation announced success unconditionally while writing

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Answers no longer go stale after files change on disk
+
+The language servers are told at startup that the client watches the disk for
+them, so they don't watch it themselves. Nothing did. An edit made outside this
+server, including an agent's ordinary file edit, went unseen by any query that
+didn't open the edited file itself:
+
+- **Python:** pyright went on reporting the old code, even after
+  `rename_symbol`'s own writes.
+- **C#:** Roslyn missed edits made on disk.
+- **TypeScript** was unaffected, because tsserver watches the disk regardless.
+
+Every tool call now checks the language's source files for changes first and
+reports them to the language server. Files it holds open get their new contents
+directly. The first query after an edit is correct: it was measured that way on
+Python, C# and TypeScript.
+
+**You no longer need to route edits through this server to keep it accurate.**
+Edit files however you like.
+
+The check costs 40–120 ms per call on an ordinary repository. It is logged
+when it exceeds half a second, which happens on a directory holding many
+repositories.
+
 ## 0.4.0 — 2026-09-19
 
 ### One server now covers a whole repository
