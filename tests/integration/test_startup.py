@@ -25,6 +25,7 @@ EXPECTED_TOOLS = {
     "get_symbol_body", "get_file_diagnostics", "find_definition", "explain_symbol",
     "blast_radius", "rename_symbol", "find_implementations",
     "type_definition", "call_hierarchy", "type_hierarchy", "code_action",
+    "replace_symbol_body", "insert_before_symbol", "insert_after_symbol", "safe_delete_symbol",
 }
 
 

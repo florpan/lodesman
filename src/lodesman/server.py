@@ -851,12 +851,15 @@ TOOLS = [
         "description": (
             "The full source of one declaration, by name — a method, class or function — "
             "without reading the file it lives in. Use this instead of opening a file to "
-            "look at a single member."
+            "look at a single member. The text is exactly what replace_symbol_body "
+            "replaces, so it can be edited and passed back."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Symbol name"},
+                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
+                "file": {"type": "string", "description": "Optional: file containing it"},
+                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
             },
             "required": ["name"],
         },
@@ -1013,6 +1016,80 @@ TOOLS = [
                     "enum": ["both", "supertypes", "subtypes"],
                     "description": "Default both.",
                 },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "replace_symbol_body",
+        "description": (
+            "Replace a whole declaration — signature and body — by name, without "
+            "reading the file. Returns the diff and the file's errors afterwards. "
+            "Qualify an ambiguous name as Type.member, or pass file/line. The body's "
+            "first line goes where the declaration starts; later lines are used as "
+            "given, so the output of get_symbol_body can be edited and passed back."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
+                "body": {"type": "string", "description": "The complete new declaration"},
+                "file": {"type": "string", "description": "Optional: file containing it"},
+                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
+            },
+            "required": ["name", "body"],
+        },
+    },
+    {
+        "name": "insert_before_symbol",
+        "description": (
+            "Insert code on its own lines directly before a declaration (above its "
+            "doc comment or attributes). Content is used verbatim, indentation "
+            "included. Returns the diff and the file's errors afterwards."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
+                "content": {"type": "string", "description": "Code to insert"},
+                "file": {"type": "string", "description": "Optional: file containing it"},
+                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
+            },
+            "required": ["name", "content"],
+        },
+    },
+    {
+        "name": "insert_after_symbol",
+        "description": (
+            "Insert code on its own lines directly after a declaration — e.g. a new "
+            "method after an existing one. Content is used verbatim, indentation "
+            "included; start it with an empty line for a blank separator. Returns "
+            "the diff and the file's errors afterwards."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
+                "content": {"type": "string", "description": "Code to insert"},
+                "file": {"type": "string", "description": "Optional: file containing it"},
+                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
+            },
+            "required": ["name", "content"],
+        },
+    },
+    {
+        "name": "safe_delete_symbol",
+        "description": (
+            "Delete a declaration, with its doc comment and attributes — only if "
+            "nothing uses it. Refuses, listing the usages, if the language server "
+            "reports any references or a text search finds the name elsewhere."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
+                "file": {"type": "string", "description": "Optional: file containing it"},
+                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
             },
             "required": ["name"],
         },
@@ -1599,6 +1676,100 @@ def apply_steps(root: Path, steps: list[tuple]) -> tuple[int, int, list[str]]:
     return changed, unchanged, failed
 
 
+def bare_name(name: str) -> str:
+    """A symbol name without the signature some servers append: 'Get(string)' -> 'Get'."""
+    return re.split(r"[(<]", name or "", maxsplit=1)[0].strip()
+
+
+def name_path(name: str) -> list[str]:
+    """'MemoryStore.get', 'MemoryStore/get' and 'MemoryStore::get' all mean the same."""
+    return [part for part in re.split(r"::|\.|/", name or "") if part]
+
+
+def containers(symbol: dict) -> list[str]:
+    """Names of the symbols enclosing `symbol`, outermost first."""
+    chain = []
+    parent = symbol.get("parent")
+    while parent:
+        chain.append(bare_name(parent.get("name", "")))
+        parent = parent.get("parent")
+    return chain[::-1]
+
+
+def range_contains(outer: dict, inner: dict) -> bool:
+    """Whether LSP range `outer` strictly encloses `inner`."""
+    def at(position: dict) -> tuple[int, int]:
+        return position["line"], position["character"]
+    return outer != inner and at(outer["start"]) <= at(inner["start"]) and at(inner["end"]) <= at(outer["end"])
+
+
+# Line prefixes that belong to the declaration below them: doc comments,
+# decorators, annotations, attributes. Language servers disagree about whether
+# a declaration's range includes them, so they are found by looking upwards —
+# otherwise inserting "before" a method splits it from its doc comment, and
+# deleting it leaves the comment behind describing nothing.
+_C_COMMENTS = ("//", "/*", "*")
+LEADING_PREFIXES = {
+    "python": ("#", "@"),
+    "ruby": ("#",),
+    "csharp": (*_C_COMMENTS, "["),
+    "rust": (*_C_COMMENTS, "#["),
+    "php": (*_C_COMMENTS, "#["),
+}
+DEFAULT_LEADING_PREFIXES = (*_C_COMMENTS, "@")
+
+
+def leading_block_start(lines: list[str], start: int, language: str) -> int:
+    """The first line of the doc comment/attributes directly above line `start`."""
+    prefixes = LEADING_PREFIXES.get(language, DEFAULT_LEADING_PREFIXES)
+    while start > 0:
+        above = lines[start - 1].strip()
+        if not above or not above.startswith(prefixes):
+            break
+        start -= 1
+    return start
+
+
+def last_line_of(symbol_range: dict) -> int:
+    """The last line a range actually occupies: some servers end it at column 0 of the next."""
+    end = symbol_range["end"]
+    if end["character"] == 0 and end["line"] > symbol_range["start"]["line"]:
+        return end["line"] - 1
+    return end["line"]
+
+
+def as_block(text: str, eol: str) -> str:
+    """Content in the file's line endings, without trailing newlines."""
+    return text.replace("\r\n", "\n").rstrip("\n").replace("\n", eol)
+
+
+def deletion_span(lines: list[str], symbol_range: dict, first: int) -> dict:
+    """
+    The range to delete for a declaration whose leading block starts at `first`.
+
+    Whole lines when the declaration has them to itself, so no indentation or
+    empty line is left behind, and one of the blank lines around it when it sat
+    between two — deleting a method should not leave a double gap. Otherwise
+    the exact range, for a declaration sharing its line with other code.
+    """
+    start, last = symbol_range["start"], last_line_of(symbol_range)
+    head = lines[start["line"]][:utf16_index(lines[start["line"]], start["character"])]
+    end_line = lines[last]
+    tail = end_line[utf16_index(end_line, symbol_range["end"]["character"]):] \
+        if last == symbol_range["end"]["line"] else ""
+    if head.strip() or tail.strip(" \t;,"):
+        return symbol_range
+    stop = last + 1
+    if stop >= len(lines):
+        # The last thing in the file: take the blank lines above it too, or the
+        # file ends in a run of empty lines.
+        while first > 0 and not lines[first - 1].strip():
+            first -= 1
+    elif 0 < first and not lines[first - 1].strip() and not lines[stop].strip():
+        stop += 1
+    return {"start": {"line": first, "character": 0}, "end": {"line": stop, "character": 0}}
+
+
 def file_diagnostics(session: LanguageServerSession, target: str, min_severity: int) -> list[dict]:
     """Diagnostics for one file: pulled where the server supports it, else published."""
     try:
@@ -1756,34 +1927,30 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         return "\n".join(lines)
 
     if name == "get_symbol_body":
-        candidates = candidates_for(session, args["name"])
-        for candidate in candidates:
-            location = candidate.get("location") or {}
-            target = to_relative(location)
-            position = position_of(candidate)
-            if not target or not position:
-                continue
-            symbol = session.server.request_containing_symbol(
-                target, position[0], position[1], include_body=True
+        # Resolved like the edit tools and cut from the declaration's own range,
+        # so the text is exactly what replace_symbol_body replaces. It used to
+        # ask SolidLSP for the symbol containing the workspace-symbol position,
+        # which for a one-line C# member (`public int Scaled(int f) => …;`)
+        # returned the whole enclosing class — and a round trip through
+        # replace_symbol_body then nested the class inside itself.
+        matches = declaration_matches(session, args["name"], args.get("file"), args.get("line"))
+        parts = []
+        if len(matches) > 1:
+            parts.append(
+                f"{len(matches)} declarations match {args['name']!r}. Qualify it "
+                "(Type.member) or pass file and line to pick one."
             )
-            body = (symbol or {}).get("body")
-            if body is not None:
-                # SymbolBody holds a line buffer plus offsets; its repr is the
-                # offsets, not the code. get_text() is what we actually want.
-                text = body.get_text() if hasattr(body, "get_text") else str(body)
-                if text.strip():
-                    return f"{describe(candidate)}\n\n{text}"
-        # Fall back to the declaration range when the server returns no body.
-        best = candidates[0]
-        location = best.get("location") or {}
-        target = to_relative(location)
-        position = position_of(best)
-        if target and position:
-            return (
-                f"{describe(best)}\n\n(no body from the language server; showing context)\n"
-                + peek(session, target, position[0], 0, 30)
-            )
-        raise ToolError(f"symbol {args['name']!r} has no usable location")
+        texts: dict[str, str] = {}
+        for path, symbol, qualified in matches[:5]:
+            if path not in texts:
+                with open(session.root / path, encoding="utf-8", newline="") as handle:
+                    texts[path] = handle.read()
+            start = symbol["range"]["start"]["line"]
+            parts.append(f"{qualified} ({kind_of(symbol)}) — {path}:{start + 1}\n\n"
+                         + range_text(texts[path], symbol["range"]))
+        if len(matches) > 5:
+            parts.append(f"… and {len(matches) - 5} more")
+        return "\n\n".join(parts)
 
     if name == "get_file_diagnostics":
         target = repo_file(args["file"])
@@ -2235,6 +2402,10 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
     if name == "code_action":
         return code_action(session, args)
 
+    if name in ("replace_symbol_body", "insert_before_symbol", "insert_after_symbol",
+                "safe_delete_symbol"):
+        return edit_symbol(session, name, args)
+
     raise ToolError(f"unknown tool: {name}")
 
 
@@ -2348,6 +2519,211 @@ def code_action(session: LanguageServerSession, args: dict) -> str:
         raise ToolError("\n".join(summary + ["Nothing was written: the files already matched."]))
     summary.append(f"\nWritten: {written} file(s). Run get_file_diagnostics on them to confirm the result compiles.")
     return "\n".join(summary)
+
+
+def declaration_matches(session: LanguageServerSession, name: str, file: str | None,
+                        line: int | None) -> list[tuple[str, dict, str]]:
+    """
+    Every declaration `name` can mean, as (file, document symbol, qualified name).
+
+    Resolved through document symbols rather than workspace symbols, because
+    they carry the enclosing types (so `MemoryStore.get` can be told from
+    `NullStore.get`) and the declaration's full range. A match nested inside
+    another match is dropped, so "Record" means the class rather than its
+    constructor of the same name.
+    """
+    path = name_path(name)
+    if not path:
+        raise ToolError("name is required")
+    leaf, qualifiers = path[-1], path[:-1]
+    if file:
+        files = [repo_file(file)]
+    else:
+        files = sorted({
+            p for p in (to_relative(h.get("location") or {})
+                        for h in workspace_hits(session, leaf) if bare_name(h.get("name", "")) == leaf)
+            if p
+        })
+        if not files:
+            raise ToolError(f"no declaration named {leaf!r} found in the project")
+
+    matches = []
+    for candidate_file in files:
+        for symbol in symbols_of(session.server.request_document_symbols(candidate_file)):
+            if bare_name(symbol.get("name", "")) != leaf or not symbol.get("range"):
+                continue
+            chain = containers(symbol)
+            if qualifiers and chain[-len(qualifiers):] != qualifiers:
+                continue
+            matches.append((candidate_file, symbol, ".".join([*chain, leaf])))
+    if line is not None:
+        wanted = int(line) - 1
+        matches = [m for m in matches
+                   if m[1]["range"]["start"]["line"] <= wanted <= last_line_of(m[1]["range"])]
+    matches = [m for m in matches
+               if not any(o[0] == m[0] and range_contains(o[1]["range"], m[1]["range"]) for o in matches)]
+    if not matches:
+        where = f" in {files[0]}" if file else ""
+        raise ToolError(f"no declaration matching {name!r}{where}")
+    return matches
+
+
+def edit_target(session: LanguageServerSession, name: str, file: str | None,
+                line: int | None) -> tuple[str, dict, str]:
+    """
+    The one declaration an edit means: (file, document symbol, qualified name).
+
+    Read-only tools may take the likeliest match; an edit may not, because a
+    wrong guess rewrites the wrong code. The fixture already has the trap:
+    `get` is declared in both MemoryStore and NullStore. Anything ambiguous is
+    refused with the candidates listed.
+    """
+    matches = declaration_matches(session, name, file, line)
+    if len(matches) > 1:
+        listed = "\n".join(f"  {q} — {f}:{s['range']['start']['line'] + 1}" for f, s, q in matches)
+        raise ToolError(
+            f"{name!r} matches {len(matches)} declarations, and an edit will not guess:\n{listed}\n"
+            "Qualify the name (Type.member), or pass file and line."
+        )
+    return matches[0]
+
+
+def range_text(text: str, symbol_range: dict) -> str:
+    """The exact text an LSP range covers, measured the way apply_edits_to_text measures."""
+    marker = "\x00"
+    marked = apply_edits_to_text(text, [
+        {"range": {"start": symbol_range["start"], "end": symbol_range["start"]}, "newText": marker},
+        {"range": {"start": symbol_range["end"], "end": symbol_range["end"]}, "newText": marker},
+    ])
+    return marked.split(marker)[1] if marked.count(marker) == 2 else ""
+
+
+def error_summary(errors: list[dict], limit: int = 5) -> list[str]:
+    rows = []
+    for item in errors[:limit]:
+        line = ((item.get("range") or {}).get("start") or {}).get("line")
+        code = f" [{item['code']}]" if item.get("code") else ""
+        rows.append(f"  L{line + 1 if isinstance(line, int) else '?'}{code}: {item.get('message')}")
+    if len(errors) > limit:
+        rows.append(f"  … and {len(errors) - limit} more")
+    return rows
+
+
+def refuse_if_used(session: LanguageServerSession, path: str, symbol: dict,
+                   qualified: str, first: int) -> None:
+    """
+    Raise unless nothing uses the declaration.
+
+    Two independent sources must agree. The language server's references come
+    first. Then a plain text search for the name, because an empty answer is
+    exactly what a server gives when it cannot answer: unlicensed intelephense
+    returns no references for a class used next door, and no server sees
+    reflection, DI registration or a name in a string. Deleting on that
+    silence would be the confident wrong answer this project exists to avoid.
+    A common name is therefore refused more often than strictly needed; that
+    is the safe direction to be wrong in, and the agent can still delete by
+    hand.
+    """
+    last = last_line_of(symbol["range"])
+
+    def inside(file: str | None, line: int) -> bool:
+        return file == path and first <= line <= last
+
+    position = position_of(symbol)
+    references = session.server.request_references(path, *position) if position else []
+    used = []
+    for reference in references or []:
+        location = reference.get("location") or reference
+        file = to_relative(location)
+        line = ((location.get("range") or {}).get("start") or {}).get("line")
+        if isinstance(line, int) and not inside(file, line):
+            used.append((file, line))
+    if used:
+        rows = [f"  {f}:{n + 1}: {source_line(session, f, n)}" for f, n in used[:10]]
+        more = [f"  … and {len(used) - 10} more"] if len(used) > 10 else []
+        raise ToolError("\n".join(
+            [f"Not deleted: the language server reports {len(used)} reference(s) to {qualified}:",
+             *rows, *more]
+        ))
+
+    pattern = re.compile(rf"(?<![\w$]){re.escape(bare_name(symbol.get('name', '')))}(?![\w$])")
+    mentions = []
+    for absolute in sorted(scan_sources(session.root, session.language)):
+        if is_project_file(absolute, session.language):
+            continue
+        file = os.path.relpath(absolute, session.root).replace(os.sep, "/")
+        try:
+            with open(absolute, encoding="utf-8", errors="replace", newline="") as handle:
+                contents = handle.read().splitlines()
+        except OSError:
+            continue
+        mentions += [(file, n, text.strip()) for n, text in enumerate(contents)
+                     if pattern.search(text) and not inside(file, n)]
+    if mentions:
+        rows = [f"  {f}:{n + 1}: {text}" for f, n, text in mentions[:10]]
+        more = [f"  … and {len(mentions) - 10} more"] if len(mentions) > 10 else []
+        reason = (
+            f"Not deleted: the language server reports no references to {qualified}, but "
+            f"the name appears {len(mentions)} more time(s) in the source. They may be "
+            "usages it cannot see (reflection, DI, strings) or unrelated names — check "
+            "them, and delete by hand if they are unrelated:"
+        )
+        raise ToolError("\n".join([reason, *rows, *more]))
+
+
+def edit_symbol(session: LanguageServerSession, tool: str, args: dict) -> str:
+    """replace_symbol_body, insert_before_symbol, insert_after_symbol, safe_delete_symbol."""
+    path, symbol, qualified = edit_target(session, args["name"], args.get("file"), args.get("line"))
+    with open(session.root / path, encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    eol = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    symbol_range = symbol["range"]
+    first = leading_block_start(lines, symbol_range["start"]["line"], session.language)
+    where = f"{qualified} — {path}:{symbol_range['start']['line'] + 1}"
+
+    if tool == "replace_symbol_body":
+        # The range starts after the indentation, so only the first line loses
+        # its own; the rest is the agent's, verbatim.
+        body = args["body"].replace("\r\n", "\n").strip("\n").lstrip(" \t")
+        edit = {"range": symbol_range, "newText": body.replace("\n", eol)}
+        verb = f"Replaced {where}"
+    elif tool == "insert_after_symbol":
+        last = last_line_of(symbol_range)
+        at = {"line": last, "character": utf16_units(lines[last])}
+        edit = {"range": {"start": at, "end": at}, "newText": eol + as_block(args["content"], eol)}
+        verb = f"Inserted after {where}"
+    elif tool == "insert_before_symbol":
+        at = {"line": first, "character": 0}
+        edit = {"range": {"start": at, "end": at}, "newText": as_block(args["content"], eol) + eol}
+        verb = f"Inserted before {where}"
+    else:
+        refuse_if_used(session, path, symbol, qualified, first)
+        edit = {"range": deletion_span(lines, symbol_range, first), "newText": ""}
+        verb = f"Deleted {where}"
+
+    # Errors before and after, so the answer says whether the edit caused them.
+    try:
+        before = len(file_diagnostics(session, path, 1))
+    except Exception:  # noqa: BLE001 — a missing count only weakens the report
+        before = None
+    steps = [("edit", path, [edit])]
+    diff = preview_steps(session.root, steps)
+    changed, _unchanged, failed = apply_steps(session.root, steps)
+    session.sync_with_disk()
+    if failed:
+        raise ToolError("\n".join([f"{verb}: failed to write", *failed]))
+    if not changed:
+        return f"{verb}: nothing changed — the file already had exactly this text."
+
+    try:
+        errors = file_diagnostics(session, path, 1)
+        was = f" (was {before})" if before is not None and before != len(errors) else ""
+        verdict = ([f"{path}: no errors after the edit{was}."] if not errors else
+                   [f"{path}: {len(errors)} error(s) after the edit{was}:", *error_summary(errors)])
+    except Exception as exc:  # noqa: BLE001
+        verdict = [f"(could not read diagnostics afterwards: {exc}; run get_file_diagnostics)"]
+    return "\n".join([f"{verb}.", diff, "", *verdict])
 
 
 def send(message: dict) -> None:

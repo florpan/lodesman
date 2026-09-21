@@ -112,6 +112,9 @@ agrees with.
 | `call_hierarchy` | who calls this, or what it calls, to a chosen depth |
 | `type_hierarchy` | what a type inherits and implements, and what derives from it |
 | `code_action` | the server's quick fixes and refactorings — add a missing import, and so on |
+| `replace_symbol_body` | replace one declaration by name, without reading its file |
+| `insert_before_symbol` / `insert_after_symbol` | add code next to a declaration, e.g. a new method |
+| `safe_delete_symbol` | delete a declaration, only if nothing uses it |
 
 `blast_radius` and `get_file_diagnostics` are the two that exist specifically because agents
 edit code they haven't read: one tells you the cost of a change before you make

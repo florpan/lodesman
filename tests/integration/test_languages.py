@@ -27,6 +27,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from tests.integration import languages
 from tests.integration.harness import Server
@@ -140,7 +141,7 @@ class LanguageContract:
     def test_find_symbol_resolves_a_type(self):
         self.assertIn("Record", self.call("find_symbol", name="Record"))
 
-    def test_document_symbols_outlines_a_file(self):
+    def test_get_symbols_overview_outlines_a_file(self):
         outline = self.call("get_symbols_overview", file=self.spec.outline_file)
         for symbol in self.spec.outline_symbols:
             with self.subTest(symbol=symbol):
@@ -220,6 +221,97 @@ class LanguageContract:
             return
         self.assertIn("is of type", text)
         self.assertIn(expected, text.split("is of type", 1)[1])
+
+    # -- editing --------------------------------------------------------------
+
+    COMMENT: ClassVar[dict[str, str]] = {"python": "#", "ruby": "#"}
+
+    @staticmethod
+    def error_count(server: Server, file: str) -> int:
+        text, is_error = server.call("get_file_diagnostics", {"file": file, "severity": 1})
+        if is_error or "no errors" in text:
+            return 0
+        match = re.search(r"(\d+) error\(s\)", text)
+        return int(match.group(1)) if match else 0
+
+    def scaled_method(self) -> str:
+        """Record's scaled method, qualified, in this fixture's casing."""
+        return "Record." + self.locate(r"\b((?i:scaled))\s*\(")[2]
+
+    def test_replace_symbol_body_round_trips_get_symbol_body(self):
+        # get_symbol_body's text is defined as exactly what replace_symbol_body
+        # replaces. The contract: edit it, pass it back, and only that changes.
+        # A one-line C# member used to come back as its whole class, and the
+        # round trip nested the class inside itself.
+        repo, server = self.fresh_server()
+        method = self.scaled_method()
+        text, is_error = server.call("get_symbol_body", {"name": method})
+        self.assertFalse(is_error, text)
+        header, body = text.split("\n\n", 1)
+        file = re.search(r" — (\S+):\d+$", header).group(1)
+        self.assertIn("factor", body)
+        before = self.error_count(server, file)
+
+        text, is_error = server.call(
+            "replace_symbol_body", {"name": method, "body": body.replace("factor", "multiplier")}
+        )
+        self.assertFalse(is_error, text)
+        written = (repo / file).read_text(encoding="utf-8")
+        self.assertIn("multiplier", written)
+        self.assertNotIn("factor", written)
+        self.assertLessEqual(self.error_count(server, file), before,
+                             f"the round trip introduced errors:\n{text}")
+
+    def test_edits_refuse_an_ambiguous_name(self):
+        # `get` is declared by Store, MemoryStore and NullStore alike: an edit
+        # that picked one would rewrite whichever came first.
+        method = self.locate(r"\b((?i:get))\s*\(")[2]
+        before = self.snapshot(self.repo)
+        text, is_error = self.server.call("replace_symbol_body", {"name": method, "body": "x"})
+        self.assertTrue(is_error, text)
+        self.assertIn("will not guess", text)
+        self.assertEqual(self.snapshot(self.repo), before)
+
+    def test_inserts_land_next_to_the_symbol(self):
+        repo, server = self.fresh_server()
+        marker = self.COMMENT.get(self.spec.language, "//")
+        text, is_error = server.call(
+            "insert_before_symbol", {"name": "NullStore", "content": f"{marker} before-marker"}
+        )
+        self.assertFalse(is_error, text)
+        file = re.search(r"— (\S+):\d+\.", text).group(1)
+        lines = (repo / file).read_text(encoding="utf-8").splitlines()
+        at = next(i for i, line in enumerate(lines) if "before-marker" in line)
+        self.assertIn("NullStore", lines[at + 1])
+
+        method = self.scaled_method()
+        text, is_error = server.call(
+            "insert_after_symbol", {"name": method, "content": f"    {marker} after-marker"}
+        )
+        self.assertFalse(is_error, text)
+        self.assertIn("after-marker", text)  # the diff shows it
+        self.assertNotIn("(was", text, f"the insert changed the error count:\n{text}")
+
+    def test_safe_delete_refuses_a_used_symbol(self):
+        before = self.snapshot(self.repo)
+        text, is_error = self.server.call("safe_delete_symbol", {"name": "Record"})
+        self.assertTrue(is_error, text)
+        self.assertIn("Not deleted", text)
+        self.assertEqual(self.snapshot(self.repo), before)
+
+    def test_safe_delete_decides_by_what_is_there(self):
+        # NullStore is unused in some fixtures and referenced in others, so the
+        # property is about the decision, not the outcome: a refusal must point
+        # at real mentions, and a deletion must leave none behind.
+        repo, server = self.fresh_server()
+        text, is_error = server.call("safe_delete_symbol", {"name": "NullStore"})
+        if is_error:
+            self.assertIn("Not deleted", text)
+            self.assertIn("NullStore", text.split(":", 1)[1])
+            return
+        self.assertIn("Deleted", text)
+        remaining = [p for p, raw in self.snapshot(repo).items() if b"NullStore" in raw]
+        self.assertEqual(remaining, [], "deleted while the name was still in use")
 
     def test_rename_writes_to_disk_and_preserves_line_endings(self):
         # Its own repository and server: this one mutates, and the read-only

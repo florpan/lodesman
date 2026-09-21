@@ -11,6 +11,43 @@ The old names didn't say what the tools return. **Anything that calls the
 old names, such as prompts or permission rules, needs updating.** The entries
 below use the new names, including for changes made before the rename.
 
+### Editing tools
+
+- **`replace_symbol_body`**: replace a declaration, signature and body, by
+  name.
+- **`insert_before_symbol`** / **`insert_after_symbol`**: add code next to a
+  declaration.
+- **`safe_delete_symbol`**: delete a declaration, but only if nothing uses it.
+
+What they have in common:
+
+- **Names resolve through the file's symbol outline**, so they can be
+  qualified (`MemoryStore.get`) and narrowed with `file` and `line`. An
+  ambiguous name is refused with the candidates listed; an edit never guesses.
+- **They write directly.** The agent supplies the text, so there's nothing to
+  preview. The answer is the diff plus the file's errors after the edit, with
+  the count from before when it changed.
+- **Line endings are preserved.** Doc comments, attributes and decorators
+  directly above a declaration stay with it: they're skipped by an insert
+  "before" and removed by a delete.
+- **`safe_delete_symbol` needs two sources to agree:** the language server
+  reports no references, and a text search finds the name nowhere else. An
+  empty reference list is also what a server returns when it can't answer (an
+  unlicensed intelephense, or usages through reflection or DI), so a common
+  name is refused more often than strictly necessary. That's the safe
+  direction to be wrong in.
+
+Since the disk sync, a plain file edit is equally safe. These tools exist to
+save reading the file, and to report the result without a second call.
+
+### `get_symbol_body` returned a whole class for a one-line C# member
+
+For a member like `public int Scaled(int f) => Value * f;` it returned the
+entire enclosing class. It now resolves names like the editing tools do and
+returns exactly the declaration's text, which is what `replace_symbol_body`
+replaces, so the output can be edited and passed straight back. It also
+accepts qualified names, and shows every match for an ambiguous one.
+
 ### Four new tools
 
 - **`type_definition`**: what type a field, property or local variable is. The
