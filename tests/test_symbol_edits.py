@@ -22,6 +22,7 @@ from lodesman.server import (
     bare_name,
     containers,
     deletion_span,
+    go_receiver,
     last_line_of,
     leading_block_start,
     name_path,
@@ -61,6 +62,15 @@ class TestNames(unittest.TestCase):
         for raw, expected in cases.items():
             with self.subTest(name=raw):
                 self.assertEqual(split_symbol_name(raw), expected)
+
+    def test_go_receivers_are_read_from_the_declaration_line(self):
+        # SolidLSP's gopls wrapper strips "(Record).Scaled" to "Scaled", so the
+        # receiver has to come from the source.
+        self.assertEqual(go_receiver("func (r Record) Scaled(factor int) int {"), "Record")
+        self.assertEqual(go_receiver("func (m *MemoryStore) Get(key string) *Record {"), "MemoryStore")
+        self.assertEqual(go_receiver("func (NullStore) Put(record Record) {}"), "NullStore")
+        self.assertEqual(go_receiver("func (c *Cache[K]) Put(k K) {"), "Cache")
+        self.assertIsNone(go_receiver("func NewMemoryStore() *MemoryStore {"))
 
     def test_an_impl_block_contributes_its_type_to_the_chain(self):
         impl = {"name": "impl Record", "parent": {"name": "fixture", "parent": None}}

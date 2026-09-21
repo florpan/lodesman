@@ -1694,8 +1694,11 @@ def split_symbol_name(name: str) -> tuple[list[str], str, bool]:
 
     * gopls names a method by its receiver, and lists it at the top level of
       the outline rather than under its type: "(*MemoryStore).Get",
-      "(NullStore).Get" (gopls/internal/golang/symbols.go). Its workspace
-      search qualifies instead: "MemoryStore.Get".
+      "(NullStore).Get" (gopls/internal/golang/symbols.go). SolidLSP's
+      wrapper strips that to "Get" before it reaches us, so for Go outlines
+      go_receiver reads the type from the source instead; this form is
+      handled for servers reached without that wrapper. gopls's workspace
+      search qualifies differently: "MemoryStore.Get".
     * rust-analyzer groups methods under their impl block, named
       "impl Record" or "impl Store for MemoryStore". Such a block is not a
       declaration of its own but stands for its type as a container — so
@@ -1711,6 +1714,22 @@ def split_symbol_name(name: str) -> tuple[list[str], str, bool]:
         return [], impl.group(1).split("::")[-1], True
     parts = name_path(bare_name(name))
     return parts[:-1], (parts[-1] if parts else ""), False
+
+
+GO_RECEIVER = re.compile(r"^\s*func\s*\(\s*(?:\w+\s+)?\*?(\w+)")
+
+
+def go_receiver(declaration_line: str) -> str | None:
+    """
+    The receiver type of a Go method, from its declaration line.
+
+    gopls names methods "(*MemoryStore).Get", but SolidLSP's gopls wrapper
+    strips that to "Get" (gopls.py, _normalize_symbol_name), so by the time
+    the outline reaches us a method has lost its type. The declaration line
+    still has it, and Go's syntax for it is fixed: `func (m *MemoryStore) Get`.
+    """
+    match = GO_RECEIVER.match(declaration_line)
+    return match.group(1) if match else None
 
 
 def containers(symbol: dict) -> list[str]:
@@ -2578,11 +2597,17 @@ def declaration_matches(session: LanguageServerSession, name: str, file: str | N
 
     matches = []
     for candidate_file in files:
+        source = file_lines(session, candidate_file) if session.language == "go" else []
         for symbol in symbols_of(session.server.request_document_symbols(candidate_file)):
             own, symbol_leaf, impl_block = split_symbol_name(symbol.get("name", ""))
             if impl_block or symbol_leaf != leaf or not symbol.get("range"):
                 continue
             chain = [*containers(symbol), *own]
+            if source and not own:
+                start = symbol["range"]["start"]["line"]
+                receiver = go_receiver(source[start]) if start < len(source) else None
+                if receiver:
+                    chain.append(receiver)
             if qualifiers and chain[-len(qualifiers):] != qualifiers:
                 continue
             matches.append((candidate_file, symbol, ".".join([*chain, leaf])))
