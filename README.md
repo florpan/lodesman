@@ -303,7 +303,21 @@ Testing help is very welcome.
 
 ### Known issues
 
-None currently open.
+- **C / C++: edits on disk are not picked up by symbol search.** clangd's
+  workspace search keeps listing a renamed type under its old name. Lodesman
+  reports each changed file to it and reopens the file; that fixes the other
+  languages, but not clangd. Seen in CI only; the cause is not yet
+  established. Tools that read a file directly, such as
+  `get_file_diagnostics`, see the edit.
+- **Swift: symbol search is intermittently stale.** sourcekit-lsp answers
+  project-wide searches from its index store, which sometimes lags edits
+  and sometimes briefly loses a symbol. Tools that take a name fall back to
+  the files' own outlines when the search comes back empty, so they keep
+  working. `find_symbol` does not fall back, so it can miss a symbol.
+- **PHP without a licence:** intelephense reserves references, rename,
+  implementations, type definition, type hierarchy and code actions for
+  licensed users. Without `INTELEPHENSE_LICENSE_KEY` these are refused or
+  reported as inconclusive, never answered as empty.
 
 Fixed in 0.3.1:
 
@@ -338,8 +352,8 @@ server — startup, language detection, the tool surface, and path containment,
 which is enforced before any language server is contacted. A couple of seconds,
 no downloads.
 
-The rename tests drive a real language server and are opt-in, because a cold
-machine has to download one first:
+The integration tests drive real language servers and are opt-in, because a
+cold machine has to download them first:
 
 ```bash
 LODESMAN_INTEGRATION=1 python -m unittest discover -t . -s tests
@@ -357,10 +371,21 @@ for coverage, but the two conditions are not the same claim.
 lodesman auto-detects, all modelling the same thing — a `Record` type, a `Store`
 interface, two implementations, and a second file that uses them — so the
 assertions are identical across languages and only the syntax differs. Each
-language then gets the same contract asserted against it: find a symbol, outline
-a file, resolve a definition, find cross-file references, return a body, explain
-a symbol, answer or decline implementations, and rename to disk without
-disturbing line endings.
+language then gets the same 18-test contract asserted against it:
+
+- **Navigation:** find a symbol, outline a file, resolve a definition, find
+  cross-file references, return a body, explain a symbol, answer or decline
+  implementations, follow the call and type hierarchies, and resolve a local's
+  type.
+- **Editing:** round-trip a body through `get_symbol_body` and
+  `replace_symbol_body`, refuse an ambiguous name, insert next to a symbol,
+  refuse to delete a used one, and justify any deletion it does make.
+- **Staying current:** rename to disk without disturbing line endings, and
+  see both its own writes and edits made directly on disk.
+
+C# and TypeScript also run `code_action` end to end (adding a missing import,
+then confirming the file compiles), and C# runs `get_file_diagnostics` against
+a never-restored project, a failed restore, and a clean one.
 
 The set is tied to `EXTENSION_LANGUAGES` rather than to a popularity list, and a
 test enforces that: adding a language to the detector without adding a fixture
@@ -370,22 +395,29 @@ What actually passes, measured in CI on every push rather than claimed:
 
 | language | contract | needs |
 |---|---|---|
-| C# | ✅ 8/8 | nothing — Roslyn fetches .NET and itself |
-| TypeScript / JavaScript | ✅ 8/8 | node, npm |
-| Python | ✅ 8/8 | uv |
-| Go | ✅ 8/8 | go, and `go install golang.org/x/tools/gopls@latest` |
-| Rust | ✅ 8/8 | rustup, and `rustup component add rust-analyzer` |
-| Java | ✅ 8/8 | a JDK |
-| C / C++ | ✅ 8/8 | clangd |
-| Swift | ✅ 8/8 | a Swift toolchain; the package is built first |
-| PHP | ✅ 8/8 | node, npm — intelephense analyses PHP from node. References and rename need `INTELEPHENSE_LICENSE_KEY`; without one they are refused rather than answered emptily |
-| Ruby | ⚠️ 6/8 | ruby, bundler, and `gem install ruby-lsp` |
-| Kotlin | ⚠️ blocked | a JDK — SolidLSP downloads its own server |
+| C# | ✅ 18/18 | nothing: Roslyn fetches .NET and itself. `code_action` and restore tests need the .NET SDK |
+| TypeScript / JavaScript | ✅ 18/18 | node, npm |
+| Python | ✅ 18/18 | uv |
+| Go | ✅ 18/18 | go, and `go install golang.org/x/tools/gopls@latest` |
+| Rust | ✅ 18/18 | rustup, and `rustup component add rust-analyzer` |
+| Java | ✅ 18/18 | a JDK |
+| Swift | ⚠️ 17/18 | a Swift toolchain; the package is built first. Symbol search after a disk edit is intermittent (see Known issues) |
+| C / C++ | ⚠️ 16/18 | clangd. Symbol search does not pick up disk edits (see Known issues) |
+| PHP | ⚠️ 15/18 | node, npm: intelephense analyses PHP from node. Three tests need `INTELEPHENSE_LICENSE_KEY`; without one those features are refused, not answered emptily |
+| Ruby | ⚠️ 15/18 | ruby, bundler, and `gem install ruby-lsp` |
+| Kotlin | ⚠️ blocked | a JDK; SolidLSP downloads its own server |
 
-**Ruby** passes six of the eight. `find_references` and `rename_symbol` return
-nothing, and it is not a capability gap — ruby-lsp advertises both
-`referencesProvider` and `renameProvider` — nor timing, since raising its
-internal cross-file wait from 500 ms to 8 s changed nothing. Unexplained.
+Each ⚠️ counts the tests actually passed. The rest are recorded, with their
+reasons, as known failures in `tests/integration/languages.py`. A known
+failure is skipped with its reason; any other failure turns the build red.
+
+**Ruby** fails three of the eighteen, all from one gap. `find_references` and
+`rename_symbol` return nothing, and the rename-visibility test needs rename.
+It is not a capability gap: ruby-lsp advertises both `referencesProvider`
+and `renameProvider`. Nor is it timing: raising its internal cross-file wait
+from 500 ms to 8 s changed nothing. Unexplained. `safe_delete_symbol` stays
+safe on Ruby because its text search catches the usages the server does not
+report.
 
 **Kotlin** is blocked upstream, not by anything here. SolidLSP downloads
 JetBrains `intellij-server` pinned at `262.9593.0`, and **that build has
@@ -393,7 +425,9 @@ expired**: it prints `This build of intellij-server has expired` to stdout and
 exits, which surfaces as the server dying during the LSP handshake. Tracked as
 [oraios/serena#2008](https://github.com/oraios/serena/issues/2008).
 
-Pinning `263.4702.0` makes Kotlin pass 8/8, verified on Linux. It is not enabled
+Pinning `263.4702.0` made Kotlin pass the whole contract as it then stood
+(eight tests), verified on Linux; the current eighteen have not been run
+against it. It is not enabled
 by default, because doing so moves an expiring EAP pin out of upstream and into
 this repository: that build is on the same clock that killed the last one in
 under two months, and an overridden version is downloaded without the hash
@@ -412,7 +446,7 @@ error, no warning, and the old version downloads anyway.
 
 A skip is not a pass, and CI enforces that: a language that runs no tests fails
 the build unless `languages.py` records *why* it cannot run. A green tick that
-might mean "ran eight assertions" or might mean "ran nothing" is worth nothing.
+might mean "ran the whole contract" or might mean "ran nothing" is worth nothing.
 
 Anything unavailable skips with a reason naming the missing tool. CI runs the
 full matrix, one job per language, so a per-language regression is caught even
