@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-09-21
+
+Lodesman can now edit code as well as navigate it. Its answers also stay
+current while you edit files by any means, with no need to go through
+Lodesman.
+
+- **Seven new tools:**
+  - **Navigation:** `type_definition`, `call_hierarchy`, `type_hierarchy`.
+  - **Editing:** `code_action`, `replace_symbol_body`, `insert_before_symbol`
+    / `insert_after_symbol`, `safe_delete_symbol`.
+- **Two tools renamed.** `document_symbols` and `check` are now
+  `get_symbols_overview` and `get_file_diagnostics`. Update any prompts or
+  permission rules that name them.
+- **Four answers that were confidently wrong are fixed:**
+  - Stale results after edits on disk.
+  - "No errors" on broken C# in a fresh clone.
+  - Java renames that silently dropped the file move.
+  - A whole class returned as the "body" of a one-line C# member.
+- **The language contract** grew from 8 tests to 18 per language.
 
 ### Two tools renamed
 
@@ -39,6 +57,24 @@ What they have in common:
 
 Since the disk sync, a plain file edit is equally safe. These tools exist to
 save reading the file, and to report the result without a second call.
+
+### Names in Go, Rust and Swift
+
+Tools that take a name resolve it through the language server, and three
+servers needed handling of their own:
+
+- **Go:** gopls names methods by receiver, `(*MemoryStore).Get`, and
+  SolidLSP's wrapper then strips that to `Get`. Lodesman reads the receiver
+  from the declaration line, so `MemoryStore.Get` can be told from
+  `NullStore.Get`.
+- **Rust:** rust-analyzer lists methods under their `impl` block, so
+  `Record.scaled` now looks inside `impl Record`.
+- **Swift:** sourcekit-lsp answers project-wide searches from an index store
+  that sometimes briefly loses a symbol. In CI that failed a different tool
+  on each of three runs. When the search comes back empty, every tool that
+  takes a name now falls back to the outlines of the files that mention it.
+  An outline comes from the file itself, not the index. This also covers
+  editing a symbol straight after writing it, before any index has caught up.
 
 ### `get_symbol_body` returned a whole class for a one-line C# member
 

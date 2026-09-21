@@ -41,7 +41,7 @@ from solidlsp.settings import SolidLSPSettings
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "lodesman"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # Probe for the index-readiness gate: short, and matches something in any repo.
 WARM_PROBE = "a"
