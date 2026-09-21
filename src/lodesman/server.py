@@ -807,7 +807,7 @@ TOOLS = [
         },
     },
     {
-        "name": "document_symbols",
+        "name": "get_symbols_overview",
         "description": (
             "Outline one file: every type, method, and field it declares, with line "
             "numbers. The API surface of the file without reading its body."
@@ -862,7 +862,7 @@ TOOLS = [
         },
     },
     {
-        "name": "check",
+        "name": "get_file_diagnostics",
         "description": (
             "Compiler diagnostics for one file, from the already-running language server — "
             "errors and warnings in milliseconds, without a build. Run this after editing "
@@ -1334,7 +1334,7 @@ def restore_state(root: Path, target: str) -> tuple[str | None, str | None]:
     * **Never restored.** Roslyn reports no compiler diagnostics at all for a
       project it loaded without obj/project.assets.json, so "no errors" is not
       an answer. It restores such a project itself on startup and
-      sync_with_disk makes it reload, so by the time check runs this means
+      sync_with_disk makes it reload, so by the time get_file_diagnostics runs this means
       the restore could not run.
     * **Restore failed.** An unreachable feed still writes project.assets.json,
       and records the failure in its `logs`: NU1301, level Error, "Unable to
@@ -1344,7 +1344,7 @@ def restore_state(root: Path, target: str) -> tuple[str | None, str | None]:
 
     A clean restore logs no errors, and then CS0246 is a genuine missing
     using, not a symptom. Guessing from the proportion of missing-type errors,
-    as check used to, told agents not to trust a real, trivially fixable error.
+    as get_file_diagnostics (then called check) used to, told agents not to trust a real, trivially fixable error.
 
     The owning project is the nearest .csproj walking up from the file. One
     that moves its intermediate output (BaseIntermediateOutputPath, the
@@ -1646,7 +1646,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             lines.append(f"  … and {len(hits) - limit} more")
         return "\n".join(lines)
 
-    if name == "document_symbols":
+    if name == "get_symbols_overview":
         target = repo_file(args["file"])
         symbols = symbols_of(session.server.request_document_symbols(target))
         if not symbols:
@@ -1785,7 +1785,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             )
         raise ToolError(f"symbol {args['name']!r} has no usable location")
 
-    if name == "check":
+    if name == "get_file_diagnostics":
         target = repo_file(args["file"])
         # LSP severity: 1 error, 2 warning, 3 info, 4 hint. Default to errors and
         # warnings only — a file can carry dozens of style hints, and burying a
@@ -1992,7 +1992,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         if not applied and not unchanged:
             raise ToolError("\n".join(summary + ["Nothing was written."]))
         summary.append(
-            "Run check on an affected file to confirm the project still builds."
+            "Run get_file_diagnostics on an affected file to confirm the project still builds."
         )
         return "\n".join(summary)
 
@@ -2346,7 +2346,7 @@ def code_action(session: LanguageServerSession, args: dict) -> str:
         raise ToolError("\n".join(summary + ["Failed to write:"] + failed))
     if not written:
         raise ToolError("\n".join(summary + ["Nothing was written: the files already matched."]))
-    summary.append(f"\nWritten: {written} file(s). Run check on them to confirm the result compiles.")
+    summary.append(f"\nWritten: {written} file(s). Run get_file_diagnostics on them to confirm the result compiles.")
     return "\n".join(summary)
 
 

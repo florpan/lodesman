@@ -85,7 +85,7 @@ class MissingImportCase:
         self.assertIn("Written: 1 file(s)", text)
         self.assertIn(self.import_line, self.path.read_bytes())
 
-        verdict, is_error = self.server.call("check", {"file": self.file, "severity": 1})
+        verdict, is_error = self.server.call("get_file_diagnostics", {"file": self.file, "severity": 1})
         self.assertFalse(is_error, verdict)
         self.assertIn("no errors", verdict)
 

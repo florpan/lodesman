@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """
-check on C#: never call broken code clean, and never blame real errors on the
+get_file_diagnostics on C#: never call broken code clean, and never blame real errors on the
 package restore.
 
 Three situations look alike from the diagnostics and need opposite advice:
@@ -15,7 +15,7 @@ Three situations look alike from the diagnostics and need opposite advice:
   from the proportion of missing-type errors and warned that the project "did
   not load fully" — telling an agent not to trust a real, fixable error.
 
-    LODESMAN_INTEGRATION=1 python -m unittest tests.integration.test_check
+    LODESMAN_INTEGRATION=1 python -m unittest tests.integration.test_file_diagnostics
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ class TestCSharpCheck(unittest.TestCase):
         return server
 
     def check(self, server: Server, file: str) -> str:
-        text, is_error = server.call("check", {"file": file, "severity": 1})
+        text, is_error = server.call("get_file_diagnostics", {"file": file, "severity": 1})
         self.assertFalse(is_error, text)
         return text
 

@@ -151,7 +151,7 @@ jobs:
           LODESMAN_INTEGRATION: "1"
         run: |
           case "${{ matrix.language }}" in
-            csharp) tests="tests.integration.test_code_actions.TestCSharp tests.integration.test_check" ;;
+            csharp) tests="tests.integration.test_code_actions.TestCSharp tests.integration.test_file_diagnostics" ;;
             typescript) tests="tests.integration.test_code_actions.TestTypeScript" ;;
           esac
           python -m unittest -v $tests 2>&1 | tee extra.log || true

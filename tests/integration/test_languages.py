@@ -141,7 +141,7 @@ class LanguageContract:
         self.assertIn("Record", self.call("find_symbol", name="Record"))
 
     def test_document_symbols_outlines_a_file(self):
-        outline = self.call("document_symbols", file=self.spec.outline_file)
+        outline = self.call("get_symbols_overview", file=self.spec.outline_file)
         for symbol in self.spec.outline_symbols:
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, outline)

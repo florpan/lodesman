@@ -2,12 +2,12 @@
 """
 Finding the .csproj that owns a file, and what state its package restore is in.
 
-check has to tell three situations apart, because they call for opposite
+get_file_diagnostics has to tell three situations apart, because they call for opposite
 advice: a project never restored (compile errors may be missing), a restore
 that failed (missing-type errors may be phantoms), and a clean restore (a
-CS0246 is a real missing using). check used to guess from the proportion of
+CS0246 is a real missing using). It used to guess from the proportion of
 missing-type errors, and told agents not to trust a genuine missing using.
-The end-to-end behaviour is in tests/integration/test_check.py.
+The end-to-end behaviour is in tests/integration/test_file_diagnostics.py.
 
 Fast, no language server, no subprocess.
 """

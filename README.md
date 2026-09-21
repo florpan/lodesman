@@ -102,18 +102,18 @@ agrees with.
 | `find_definition` | where is this defined |
 | `find_references` | what actually uses this, with the surrounding code |
 | `find_implementations` | concrete implementations of an interface or abstract member |
-| `document_symbols` | outline one file: its types, methods and fields |
+| `get_symbols_overview` | outline one file: its types, methods and fields |
 | `get_symbol_body` | the full source of one declaration, by name |
 | `explain_symbol` | resolved type, signature and documentation |
 | `blast_radius` | what breaks if this symbol changes |
 | `rename_symbol` | rename everywhere, using the compiler's understanding |
-| `check` | compiler diagnostics for one file, from the warm server |
+| `get_file_diagnostics` | compiler diagnostics for one file, from the warm server |
 | `type_definition` | what type a variable, field or parameter actually is, as code |
 | `call_hierarchy` | who calls this, or what it calls, to a chosen depth |
 | `type_hierarchy` | what a type inherits and implements, and what derives from it |
 | `code_action` | the server's quick fixes and refactorings — add a missing import, and so on |
 
-`blast_radius` and `check` are the two that exist specifically because agents
+`blast_radius` and `get_file_diagnostics` are the two that exist specifically because agents
 edit code they haven't read: one tells you the cost of a change before you make
 it, the other verifies it afterwards without a full build.
 

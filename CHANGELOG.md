@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Two tools renamed
+
+- `document_symbols` is now **`get_symbols_overview`**.
+- `check` is now **`get_file_diagnostics`**.
+
+The old names didn't say what the tools return. **Anything that calls the
+old names, such as prompts or permission rules, needs updating.** The entries
+below use the new names, including for changes made before the rename.
+
 ### Four new tools
 
 - **`type_definition`**: what type a field, property or local variable is. The
@@ -47,9 +56,9 @@ and that likely grows with project size. This is the likeliest reason for the
 default. It can be switched back off with one constant,
 `JAVA_METHODS_IN_SYMBOL_SEARCH`.
 
-### `check` said "no errors" about broken C# in a fresh clone
+### `get_file_diagnostics` said "no errors" about broken C# in a fresh clone
 
-On a project that had never been built, `check` answered **"no errors"** for a
+On a project that had never been built, `get_file_diagnostics` answered **"no errors"** for a
 file with plain compile errors. Roslyn restores such a project itself while it
 starts up. It keeps using the project it loaded before that restore, and that
 project yields no compiler diagnostics at all (its analyzers still run). In
@@ -61,18 +70,18 @@ The disk sync now also watches project files (`.csproj`, `.props`,
 the sync waits for Roslyn to confirm it has reloaded. It also runs once right
 after startup, which covers Roslyn's own restore.
 
-### `check` no longer guesses whether the project loaded
+### `get_file_diagnostics` no longer guesses whether the project loaded
 
-`check` used to warn that the project "did not load fully, not that the code
+`get_file_diagnostics` used to warn that the project "did not load fully, not that the code
 is wrong" whenever at least half of a file's errors were missing-type errors
 (CS0246 and similar). That is also exactly what a plain missing `using` looks
 like, so a real, trivially fixable error came with advice not to trust it.
 
-`check` now reads the owning project's restore state instead of guessing:
+`get_file_diagnostics` now reads the owning project's restore state instead of guessing:
 
 - **Never restored** (no `obj/project.assets.json`): compile errors may be
   missing from the answer. Run `dotnet restore`.
-- **Restore failed**: `check` names the failure. A failed restore still writes
+- **Restore failed**: `get_file_diagnostics` names the failure. A failed restore still writes
   `project.assets.json` and records the error in it, for example
   `NU1301 Unable to load the service index` from an unreachable feed.
   Missing-type errors may then be phantoms.
