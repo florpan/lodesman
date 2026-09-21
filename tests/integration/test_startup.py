@@ -24,6 +24,7 @@ EXPECTED_TOOLS = {
     "project_info", "find_symbol", "document_symbols", "find_references",
     "get_symbol_body", "check", "find_definition", "explain_symbol",
     "blast_radius", "rename_symbol", "find_implementations",
+    "type_definition", "call_hierarchy", "type_hierarchy", "code_action",
 }
 
 

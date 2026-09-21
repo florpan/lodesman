@@ -108,6 +108,10 @@ agrees with.
 | `blast_radius` | what breaks if this symbol changes |
 | `rename_symbol` | rename everywhere, using the compiler's understanding |
 | `check` | compiler diagnostics for one file, from the warm server |
+| `type_definition` | what type a variable, field or parameter actually is, as code |
+| `call_hierarchy` | who calls this, or what it calls, to a chosen depth |
+| `type_hierarchy` | what a type inherits and implements, and what derives from it |
+| `code_action` | the server's quick fixes and refactorings — add a missing import, and so on |
 
 `blast_radius` and `check` are the two that exist specifically because agents
 edit code they haven't read: one tells you the cost of a change before you make
@@ -115,6 +119,19 @@ it, the other verifies it afterwards without a full build.
 
 `rename_symbol` is a dry run by default and lists every file it would touch.
 Pass `apply=true` to write; it reports how many files actually changed on disk.
+`code_action` works the same way: without a title it lists what is available;
+with one it shows the diff; `apply=true` writes it.
+
+Edit files however you like. Before every question the server checks the disk
+for files that changed since it last looked and tells the language server, so
+an agent's ordinary file edits are seen by the next query. Nothing has to be
+routed through this server to keep its answers current.
+
+Roslyn has neither a call hierarchy nor a type hierarchy. For C#,
+`call_hierarchy` answers incoming calls from references (which also include
+non-call references) and declines outgoing calls; `type_hierarchy` finds
+subtypes through `textDocument/implementation` and shows supertypes from the
+declaration line. Each answer says which of these it is.
 
 Tools depend on what the language server behind them implements. `pyright`, for
 instance, does not serve `textDocument/implementation`, so `find_implementations`

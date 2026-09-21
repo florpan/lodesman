@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Four new tools
+
+- **`type_definition`**: what type a field, property or local variable is. The
+  tool shows the type's declaration as code.
+- **`call_hierarchy`**: callers or callees, to a chosen depth, with the line
+  of each call.
+- **`type_hierarchy`**: supertypes and subtypes, each with its declaration
+  line.
+- **`code_action`**: the language server's quick fixes and refactorings.
+  Without a title it lists them; with one it previews the diff; with
+  `apply=true` it writes. Actions that run a command inside the server
+  instead of returning an edit are listed as such and refused, not skipped.
+
+Support differs by server. This is what was probed on 2026-09-21:
+
+| | call hierarchy | type hierarchy | type definition |
+|---|---|---|---|
+| C# (Roslyn) | no | no | yes |
+| Python (pyright) | yes | no | yes |
+| TypeScript | yes | no | yes |
+| Java (jdtls) | yes | yes | yes |
+
+Where a server lacks one, the tool falls back, and the answer says so.
+
+- **`call_hierarchy`, incoming:** falls back to the symbols that reference the
+  function.
+- **`call_hierarchy`, outgoing:** declines rather than guessing.
+- **`type_hierarchy`, subtypes:** uses `textDocument/implementation`.
+- **`type_hierarchy`, supertypes:** shows the declaration line as written.
+
+### `rename_symbol` dropped file renames
+
+jdtls renames a Java class by renaming its file too, since Java requires the
+two to match. Lodesman applied the text edits and **silently discarded the
+file rename**. That left `class VoidStore` inside `NullStore.java`, a file
+that no longer compiles, and reported success. File renames are now applied,
+in the order the server sends them. File creations and deletions are refused
+out loud. A change that would touch anything outside the repository is refused
+as a whole before anything is written. Before, only that part was skipped.
+
 ### Answers no longer go stale after files change on disk
 
 The language servers are told at startup that the client watches the disk for
@@ -12,12 +52,15 @@ didn't open the edited file itself:
 - **Python:** pyright went on reporting the old code, even after
   `rename_symbol`'s own writes.
 - **C#:** Roslyn missed edits made on disk.
-- **TypeScript** was unaffected, because tsserver watches the disk regardless.
+- **TypeScript** was stale some of the time. tsserver watches the disk itself,
+  but in repeated runs the same rename showed up at once on some and not
+  within 20 seconds on others.
 
-Every tool call now checks the language's source files for changes first and
-reports them to the language server. Files it holds open get their new contents
-directly. The first query after an edit is correct: it was measured that way on
-Python, C# and TypeScript.
+Every tool call now checks the language's source files for changes first. Each
+changed file is reported to the language server and briefly reopened, so the
+server receives its new contents directly. The first query after an edit is
+correct: it was measured that way on Python, C# and TypeScript, the last across
+five repeated runs.
 
 **You no longer need to route edits through this server to keep it accurate.**
 Edit files however you like.

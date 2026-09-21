@@ -22,6 +22,7 @@ behind the detector.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -175,6 +176,37 @@ class LanguageContract:
         else:
             self.assertIn("implementation", text.lower())
 
+    def locate(self, pattern: str) -> tuple[str, int, str]:
+        """(file, 1-based line, matched text) of the first match across the fixture."""
+        for relative, content in self.spec.files.items():
+            match = re.search(pattern, content)
+            if match:
+                return relative, content.count("\n", 0, match.start(1)) + 1, match.group(1)
+        raise LookupError(f"{self.spec.language} fixture has nothing matching {pattern}")
+
+    def test_call_hierarchy_finds_the_caller(self):
+        # Service's total calls Record's scaled in every fixture. Servers
+        # without a call hierarchy must still answer incoming calls, from the
+        # reference machinery, and say that they did.
+        method = self.locate(r"\b((?i:scaled))\s*\(")[2]
+        text = self.call("call_hierarchy", name=method)
+        self.assertIn("total", text.lower())
+
+    def test_type_hierarchy_finds_both_implementations(self):
+        text = self.call("type_hierarchy", name="Store", direction="subtypes")
+        if "unavailable" in text:
+            return  # declared, which is what a server with neither method owes us
+        self.assertIn("MemoryStore", text)
+        self.assertIn("NullStore", text)
+
+    def test_type_definition_resolves_a_local(self):
+        # `record` in `record.scaled(2)` is a local in every fixture: not a
+        # workspace symbol, so this is the pointed-at form of the tool.
+        file, line, identifier = self.locate(r"\b(record)\s*[.?]+\s*(?i:scaled)")
+        text = self.call("type_definition", file=file, line=line, symbol=identifier)
+        self.assertIn("is of type", text)
+        self.assertIn("Record", text.split("is of type", 1)[1])
+
     def test_rename_writes_to_disk_and_preserves_line_endings(self):
         # Its own repository and server: this one mutates, and the read-only
         # tests share a warm server that must not see the fixture change
@@ -203,7 +235,15 @@ class LanguageContract:
         after = self.snapshot(repo)
         changed = [p for p in before if after.get(p) != before[p]]
         self.assertTrue(changed, "rename reported success but nothing changed on disk")
-        self.assertIn(b"VoidStore", b"".join(after.values()))
+        # Some servers move the file with the type — jdtls must, since Java
+        # requires the names to match — and the snapshot only knows the
+        # fixture's original names.
+        moved = [p for p in repo.rglob("*VoidStore*") if p.is_file()]
+        for path in moved:
+            with self.subTest(moved=path.name):
+                self.assertIn(b"VoidStore", path.read_bytes())
+        self.assertIn(b"VoidStore",
+                      b"".join([*after.values(), *(p.read_bytes() for p in moved)]))
 
         for path, raw in after.items():
             with self.subTest(file=path):
@@ -253,7 +293,7 @@ class LanguageContract:
         # computes its edits against positions that no longer exist.
         if not self.spec.supports_rename:
             self.skipTest(f"{self.spec.language}: server does not rename")
-        repo, server = self.fresh_server()
+        _repo, server = self.fresh_server()
         text, is_error = server.call(
             "rename_symbol",
             {"name": "NullStore", "new_name": "VoidStore", "apply": True},

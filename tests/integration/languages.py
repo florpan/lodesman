@@ -477,6 +477,13 @@ JAVA = LanguageSpec(
     outline_symbols=("Store",),
     requires=("java", "javac"),
     notes="jdtls wants a build file; a minimal pom keeps it out of invisible-project mode.",
+    known_failures={
+        "test_call_hierarchy_finds_the_caller":
+            "jdtls's workspace/symbol returns nothing for the method name 'scaled' "
+            "while it resolves the types, so no tool can name a Java method. Its "
+            "call hierarchy itself works: prepared at the declaration's position it "
+            "returns total as the caller. Observed 2026-09-21.",
+    },
     files={
         "pom.xml": (
             '<?xml version="1.0" encoding="UTF-8"?>\n'

@@ -24,9 +24,11 @@ in ~/.solidlsp (override with SOLIDLSP_HOME); per-project caches live under
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -416,8 +418,9 @@ class LanguageServerSession:
         with its own poller (LanguageServerManager.poll_and_notify), which is
         outside the vendored tree, and until this nothing here kept it. Measured
         before the fix: pyright never saw a file edited on disk nor our own
-        rename_symbol's writes, and Roslyn never saw a disk edit. tsserver was
-        fine only because it watches the disk itself whatever it is told.
+        rename_symbol's writes, and Roslyn never saw a disk edit. tsserver
+        watches the disk itself, but unreliably: the same rename was visible
+        at once on some runs and not within 20 s on others.
 
         This is what makes an agent's plain Edit tool safe to use alongside
         this server: the next question re-syncs before it is asked.
@@ -443,7 +446,7 @@ class LanguageServerSession:
 
         server = self._server
         open_buffers = server.open_file_buffers
-        watched = []
+        watched, reopen = [], []
         for path, change in changes:
             uri = Path(path).as_uri()
             buffer = open_buffers.get(uri)
@@ -454,9 +457,23 @@ class LanguageServerSession:
                     log(f"could not resend open file {path}: {exc}")
                 continue
             watched.append({"uri": uri, "type": change})
+            if change != FILE_DELETED:
+                reopen.append(os.path.relpath(path, self.root).replace(os.sep, "/"))
 
         if watched:
             server.server.notify.did_change_watched_files({"changes": watched})
+        # The watcher notification alone is not enough: typescript-language-
+        # server ignores it and relies on tsserver's own disk watcher, which
+        # picked up a rename within a second on some runs and not within 20 s
+        # on others, whatever we sent. Opening the file hands the server its
+        # new text directly, and on close the server reads it from disk, which
+        # by then holds that same text. One open/close per changed file, not per file.
+        for relative in reopen:
+            try:
+                with server.open_file(relative):
+                    pass
+            except Exception as exc:  # noqa: BLE001 — one file must not stop the rest
+                log(f"could not reopen {relative}: {exc}")
         log(f"synced {len(changes)} changed file(s) with the {self.language} server")
         return len(changes)
 
@@ -850,6 +867,93 @@ TOOLS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "type_definition",
+        "description": (
+            "The declaration of a symbol's type: what a variable, field, parameter or "
+            "property actually is, shown as code. Name a field or property directly, or "
+            "point at a local variable with file, line and symbol."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Field, property or member name"},
+                "file": {"type": "string", "description": "For a local: file it appears in"},
+                "line": {"type": "integer", "description": "For a local: 1-based line it appears on"},
+                "symbol": {"type": "string", "description": "For a local: the identifier on that line"},
+            },
+        },
+    },
+    {
+        "name": "call_hierarchy",
+        "description": (
+            "Who calls this function (incoming), or what it calls (outgoing), with the "
+            "line of each call. Follows the chain to the given depth, so it answers "
+            "'how does execution reach this' in one call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Function or method name"},
+                "direction": {
+                    "type": "string",
+                    "enum": ["incoming", "outgoing"],
+                    "description": "incoming (default): callers. outgoing: callees.",
+                },
+                "depth": {"type": "integer", "description": "Levels to follow, 1-4 (default 1)"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "type_hierarchy",
+        "description": (
+            "What a type inherits from and implements (supertypes), and what derives "
+            "from or implements it (subtypes), each with its declaration line."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Type name"},
+                "direction": {
+                    "type": "string",
+                    "enum": ["both", "supertypes", "subtypes"],
+                    "description": "Default both.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "code_action",
+        "description": (
+            "The language server's quick fixes and refactorings for a line: add a "
+            "missing import or using, implement an interface, extract a method and "
+            "so on. Without a title, lists what is available. With a title, previews "
+            "the change as a diff; add apply=true to write it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "Path relative to the repo root"},
+                "line": {"type": "integer", "description": "1-based line"},
+                "end_line": {"type": "integer", "description": "Optional last line of a range"},
+                "title": {
+                    "type": "string",
+                    "description": "The action to take, as listed. A unique fragment is enough.",
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Only actions of this kind, e.g. quickfix, refactor, source",
+                },
+                "apply": {
+                    "type": "boolean",
+                    "description": "Write the change. Omit or false to preview only.",
+                },
+            },
+            "required": ["file", "line"],
+        },
+    },
 ]
 
 
@@ -1136,6 +1240,228 @@ def resolve_symbol(session: LanguageServerSession, name: str) -> dict:
     return candidates_for(session, name)[0]
 
 
+def declarations(session: LanguageServerSession, name: str) -> list[tuple[str, int, int, str]]:
+    """Every usable declaration of `name` as (file, line, column, label), most likely first."""
+    found = []
+    for candidate in candidates_for(session, name):
+        path = to_relative(candidate.get("location") or {})
+        position = position_of(candidate)
+        if path and position:
+            found.append((path, position[0], position[1], describe(candidate)))
+    if not found:
+        raise ToolError(f"symbol {name!r} has no usable location")
+    return found
+
+
+class Unsupported(Exception):
+    """The language server does not implement the method at all."""
+
+
+def lsp_request(session: LanguageServerSession, file: str, method: str, params: dict):
+    """
+    Send a request SolidLSP has no wrapper for, with `file` open for its duration.
+
+    A server that lacks the method answers -32601, which is a statement about the
+    server rather than about the code, so it is raised as Unsupported and never
+    confused with an empty answer.
+    """
+    server = session.server
+    try:
+        with server.open_file(file):
+            return getattr(server.server.send, method)(params)
+    except Exception as exc:  # re-raised unless it is -32601
+        if "-32601" in f"{exc} {getattr(exc, 'cause', '')}":
+            raise Unsupported(method) from exc
+        raise
+
+
+def position_params(session: LanguageServerSession, file: str, line: int, column: int) -> dict:
+    return {
+        "textDocument": {"uri": session.server._resolve_file_uri(file)},
+        "position": {"line": line, "character": column},
+    }
+
+
+def utf16_units(text: str) -> int:
+    """Length of `text` in UTF-16 code units, which is how LSP counts columns."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
+def file_lines(session: LanguageServerSession, file: str) -> list[str]:
+    with open(session.root / file, encoding="utf-8", newline="") as handle:
+        return handle.read().splitlines()
+
+
+def source_line(session: LanguageServerSession, file: str | None, line: int) -> str:
+    """One line of source, stripped, for showing a call site or declaration inline."""
+    if not file:
+        return ""
+    try:
+        return file_lines(session, file)[line].strip()
+    except (OSError, IndexError, UnicodeDecodeError):
+        return ""
+
+
+def targets_of(result) -> list[tuple[str | None, int, str]]:
+    """
+    (file, line, uri) for each Location or LocationLink in a definition-style
+    answer. `file` is None for a target outside the repository.
+    """
+    items = result if isinstance(result, list) else [result] if result else []
+    found = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        uri = item.get("targetUri") or item.get("uri") or ""
+        rng = item.get("targetSelectionRange") or item.get("range") or {}
+        line = (rng.get("start") or {}).get("line", 0)
+        found.append((to_relative({"uri": uri}) if uri else None, line, uri))
+    return found
+
+
+def hierarchy_item(item: dict) -> tuple[str | None, int, str]:
+    """(file, line, label) for a CallHierarchyItem or TypeHierarchyItem."""
+    path = to_relative({"uri": item.get("uri", "")})
+    rng = item.get("selectionRange") or item.get("range") or {}
+    line = (rng.get("start") or {}).get("line", 0)
+    detail = f" — {item['detail']}" if item.get("detail") else ""
+    label = f"{item.get('name')} ({kind_of(item)}){detail} — {path or item.get('uri')}:{line + 1}"
+    return path, line, label
+
+
+def edit_steps(edit: dict) -> list[tuple]:
+    """
+    A WorkspaceEdit as ordered steps with repo-relative paths:
+    ("edit", path, text_edits) or ("rename", old_path, new_path).
+
+    Servers use either shape: `changes`, or `documentChanges`, which can also
+    create, rename and delete files. Renames are real refactorings — jdtls
+    renames a class by moving its file too, since Java requires the names to
+    match — so they are applied, in the order given. Dropping one would leave
+    `class VoidStore` in NullStore.java and report success, which is what
+    happened before this was written. Creation and deletion are refused out
+    loud rather than skipped, for the same reason.
+
+    Anything that would touch a path outside the repository is refused before
+    a single byte is written.
+    """
+    def inside(uri: str) -> str:
+        path = to_relative({"uri": uri})
+        if not path:
+            raise ToolError(f"this change would touch a file outside the repository: {uri}")
+        return path
+
+    document_changes = (edit or {}).get("documentChanges")
+    if not document_changes:
+        return [("edit", inside(uri), edits)
+                for uri, edits in ((edit or {}).get("changes") or {}).items()]
+    # Never both: a server may send the same edits in each shape, and the spec
+    # makes documentChanges the one that counts. Merging would apply them twice.
+    steps: list[tuple] = []
+    for entry in document_changes:
+        kind = entry.get("kind")
+        if kind == "rename":
+            steps.append(("rename", inside(entry["oldUri"]), inside(entry["newUri"])))
+        elif kind in ("create", "delete"):
+            raise ToolError(
+                f"this change would {kind} a file, which lodesman does not apply; "
+                "only edits and renames are supported"
+            )
+        else:
+            uri = (entry.get("textDocument") or {}).get("uri")
+            if uri:
+                steps.append(("edit", inside(uri), entry.get("edits") or []))
+    return steps
+
+
+def describe_steps(steps: list[tuple]) -> list[str]:
+    """One row per file, with the lines each edit starts on."""
+    rows = []
+    for step in steps:
+        if step[0] == "rename":
+            rows.append(f"  renames {step[1]} → {step[2]}")
+            continue
+        lines = sorted(((e.get("range") or {}).get("start") or {}).get("line", 0) for e in step[2])
+        more = f" (+{len(lines) - 12} more)" if len(lines) > 12 else ""
+        rows.append(f"  {step[1]} — {', '.join(f'L{n + 1}' for n in lines[:12])}{more}")
+    return rows
+
+
+def preview_steps(root: Path, steps: list[tuple], max_lines: int = 80) -> str:
+    """The unified diff the steps would produce, computed without writing anything."""
+    def read(path: str) -> str:
+        with open(root / path, encoding="utf-8", newline="") as handle:
+            return handle.read()
+
+    texts: dict[str, str] = {}
+    origin: dict[str, str] = {}  # current path -> the path it started at
+    for step in steps:
+        if step[0] == "rename":
+            _, old, new = step
+            texts[new] = texts.pop(old) if old in texts else read(old)
+            origin[new] = origin.pop(old, old)
+        else:
+            _, path, edits = step
+            if path not in texts:
+                texts[path] = read(path)
+                origin.setdefault(path, path)
+            texts[path] = apply_edits_to_text(texts[path], edits)
+
+    diff: list[str] = []
+    for path, text in texts.items():
+        diff += difflib.unified_diff(read(origin[path]).splitlines(), text.splitlines(),
+                                     f"a/{origin[path]}", f"b/{path}", n=2, lineterm="")
+    return "\n".join(diff[:max_lines]) + ("\n  … diff truncated" if len(diff) > max_lines else "")
+
+
+def apply_steps(root: Path, steps: list[tuple]) -> tuple[int, int, list[str]]:
+    """
+    Perform the steps on disk. Returns (files changed, files already identical,
+    failures).
+
+    Renames are checked before anything is written: a rename onto an existing
+    file, or of a file that is not there, stops the whole change up front
+    rather than halfway through.
+    """
+    for step in steps:
+        if step[0] == "rename":
+            _, old, new = step
+            if (root / new).exists():
+                raise ToolError(f"nothing written: renaming {old} would overwrite {new}")
+            if not (root / old).exists() and not any(
+                s[0] == "rename" and s[2] == old for s in steps
+            ):
+                raise ToolError(f"nothing written: {old} does not exist to be renamed")
+
+    changed, unchanged, failed = 0, 0, []
+    for step in steps:
+        try:
+            if step[0] == "rename":
+                _, old, new = step
+                (root / new).parent.mkdir(parents=True, exist_ok=True)
+                os.rename(root / old, root / new)
+                changed += 1
+            elif write_edits(root, step[1], step[2]):
+                changed += 1
+            else:
+                unchanged += 1
+        except OSError as exc:
+            failed.append(f"  {step[1]}: {exc}")
+    return changed, unchanged, failed
+
+
+def file_diagnostics(session: LanguageServerSession, target: str, min_severity: int) -> list[dict]:
+    """Diagnostics for one file: pulled where the server supports it, else published."""
+    try:
+        return session.server.request_text_document_diagnostics(
+            target, min_severity=min_severity
+        ) or []
+    except Exception:  # noqa: BLE001 — not every server supports pull diagnostics
+        return session.server.request_published_text_document_diagnostics(
+            target, min_severity=min_severity
+        ) or []
+
+
 def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
     if name == "project_info":
         # Deliberately does not touch session.server: the point is to confirm the
@@ -1316,14 +1642,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         # warnings only — a file can carry dozens of style hints, and burying a
         # compile error under "use primary constructor" defeats the purpose.
         min_severity = int(args.get("severity", 2))
-        try:
-            diagnostics = session.server.request_text_document_diagnostics(
-                target, min_severity=min_severity
-            ) or []
-        except Exception:  # noqa: BLE001 — not every server supports pull diagnostics
-            diagnostics = session.server.request_published_text_document_diagnostics(
-                target, min_severity=min_severity
-            ) or []
+        diagnostics = file_diagnostics(session, target, min_severity)
         names = {1: "error", 2: "warning", 3: "info", 4: "hint"}
         if not diagnostics:
             scope = names.get(min_severity, "issue")
@@ -1458,28 +1777,20 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         edit = session.server.request_rename_symbol_edit(
             target, position[0], position[1], new_name
         )
-        changes = (edit or {}).get("changes") or {}
-        if not changes and (edit or {}).get("documentChanges"):
-            for entry in edit["documentChanges"]:
-                uri = (entry.get("textDocument") or {}).get("uri")
-                if uri:
-                    changes[uri] = entry.get("edits") or []
-        if not changes:
+        steps = edit_steps(edit)
+        if not steps:
             raise ToolError(
                 f"the language server produced no edits renaming {args['name']!r} to "
                 f"{new_name!r} — it may consider the rename illegal here"
             )
 
-        total = sum(len(v) for v in changes.values())
+        total = sum(len(s[2]) for s in steps if s[0] == "edit")
+        files = {s[1] for s in steps if s[0] == "edit"}
         summary = [
             f"Rename {describe(candidate)} to {new_name!r}: "
-            f"{total} edit(s) across {len(changes)} file(s)."
+            f"{total} edit(s) across {len(files)} file(s)."
         ]
-        for uri, edits in sorted(changes.items()):
-            path = to_relative({"uri": uri}) or uri
-            rows = sorted(((e.get("range") or {}).get("start") or {}).get("line", 0) for e in edits)
-            summary.append(f"  {path} — {', '.join(f'L{r + 1}' for r in rows[:12])}"
-                           + (f" (+{len(rows) - 12} more)" if len(rows) > 12 else ""))
+        summary += describe_steps(steps)
 
         if not args.get("apply"):
             summary.append(
@@ -1489,19 +1800,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             )
             return "\n".join(summary)
 
-        applied, unchanged, failed = 0, 0, []
-        for uri, edits in changes.items():
-            path = to_relative({"uri": uri})
-            if not path:
-                summary.append(f"  skipped (outside the repo): {uri}")
-                continue
-            try:
-                if write_edits(session.root, path, edits):
-                    applied += 1
-                else:
-                    unchanged += 1
-            except OSError as exc:
-                failed.append(f"  {path}: {exc}")
+        applied, unchanged, failed = apply_steps(session.root, steps)
         # Now rather than at the next call: the server reindexes asynchronously,
         # and this gives it the time the agent spends reading this answer.
         session.sync_with_disk()
@@ -1556,7 +1855,314 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             "rather than an interface or virtual member, that is expected."
         )
 
+    if name == "type_definition":
+        if args.get("file"):
+            # A local variable is not a workspace symbol, so it cannot be found by
+            # name; it has to be pointed at.
+            target = repo_file(args["file"])
+            identifier = args.get("symbol") or ""
+            if args.get("line") is None or not identifier:
+                raise ToolError("with file, give line and symbol too")
+            line = int(args["line"]) - 1
+            lines = file_lines(session, target)
+            if not 0 <= line < len(lines):
+                raise ToolError(f"{target} has no line {line + 1}")
+            match = re.search(rf"(?<![\w$]){re.escape(identifier)}(?![\w$])", lines[line])
+            if not match:
+                raise ToolError(f"{identifier!r} does not appear on {target}:{line + 1}")
+            column = utf16_units(lines[line][:match.start()])
+            attempts = [(target, line, column, f"{identifier} — {target}:{line + 1}")]
+        elif args.get("name"):
+            attempts = declarations(session, args["name"])
+        else:
+            raise ToolError("give name, or file with line and symbol")
+
+        for path, line, column, label in attempts:
+            try:
+                result = lsp_request(session, path, "type_definition",
+                                     position_params(session, path, line, column))
+            except Unsupported:
+                raise ToolError(
+                    f"the {session.language} language server does not support "
+                    "textDocument/typeDefinition"
+                ) from None
+            targets = targets_of(result)
+            if targets:
+                parts = [f"{label} is of type:"]
+                for file, target_line, uri in targets:
+                    if file:
+                        parts.append(f"  {file}:{target_line + 1}")
+                        parts.append(peek(session, file, target_line, 1, 6))
+                    else:
+                        # A library or framework type.
+                        parts.append(f"  {uri} (outside the repository)")
+                return "\n".join(parts)
+        return (
+            f"No type definition for {args.get('symbol') or args.get('name')!r}. It may "
+            "itself be a type, or have a type the server cannot resolve (dynamic code)."
+        )
+
+    if name == "call_hierarchy":
+        direction = args.get("direction") or "incoming"
+        if direction not in ("incoming", "outgoing"):
+            raise ToolError("direction must be incoming or outgoing")
+        depth = max(1, min(int(args.get("depth", 1)), 4))
+        budget = 60
+        attempts = declarations(session, args["name"])
+
+        root_item, root_label = None, attempts[0][3]
+        try:
+            for path, line, column, label in attempts:
+                items = lsp_request(session, path, "prepare_call_hierarchy",
+                                    position_params(session, path, line, column)) or []
+                if items:
+                    root_item, root_label = items[0], label
+                    break
+        except Unsupported:
+            if direction == "outgoing":
+                raise ToolError(
+                    f"the {session.language} language server has no call hierarchy, so "
+                    "outgoing calls are not available. get_symbol_body shows the body, "
+                    "and with it what it calls."
+                ) from None
+            # Incoming has an honest substitute: the symbols containing each
+            # reference. It is what blast_radius walks, and it over-reports
+            # rather than under-reports — a reference that is not a call still
+            # appears — which is the safe direction to be wrong in.
+            text = call_tool(session, "blast_radius",
+                             {"name": args["name"], "depth": depth, "max_queries": budget})
+            return (
+                f"The {session.language} language server has no call hierarchy. Showing "
+                "the symbols that reference it instead, which also includes references "
+                "that are not calls:\n\n" + text
+            )
+        if root_item is None:
+            return (
+                f"{root_label} is not something that is called — the server offers no "
+                "call hierarchy for it. Use find_references for other kinds of usage."
+            )
+
+        method = "incoming_calls" if direction == "incoming" else "outgoing_calls"
+        other_end = "from" if direction == "incoming" else "to"
+        lines = [f"{'Callers' if direction == 'incoming' else 'Callees'} of {root_label}:"]
+        seen: set[str] = set()
+        queries = 0
+
+        def expand(item: dict, level: int, indent: str) -> None:
+            nonlocal queries
+            if level > depth or queries >= budget:
+                return
+            queries += 1
+            item_file = to_relative({"uri": item.get("uri", "")})
+            if not item_file:
+                return
+            calls = lsp_request(session, item_file, method, {"item": item}) or []
+            for call in calls:
+                peer = call.get(other_end) or {}
+                peer_file, peer_line, peer_label = hierarchy_item(peer)
+                # Incoming call sites are in the caller's file; outgoing ones are
+                # in the file being expanded.
+                site_file = peer_file if direction == "incoming" else item_file
+                sites = [((r.get("start") or {}).get("line", 0)) for r in call.get("fromRanges") or []]
+                lines.append(f"{indent}{peer_label}")
+                for site in sorted(set(sites))[:3]:
+                    lines.append(f"{indent}    L{site + 1}: {source_line(session, site_file, site)}")
+                key = f"{peer.get('uri')}:{peer_line}:{peer.get('name')}"
+                if key not in seen:
+                    seen.add(key)
+                    expand(peer, level + 1, indent + "  ")
+
+        expand(root_item, 1, "  ")
+        if len(lines) == 1:
+            return (
+                f"No {'callers' if direction == 'incoming' else 'calls'} found for "
+                f"{root_label}. For incoming, it may be reached only through an "
+                "interface, a delegate, reflection or DI, which call edges cannot see; "
+                "find_references and find_implementations cover those."
+            )
+        if queries >= budget:
+            lines.append("Query budget reached — the real hierarchy is larger than shown.")
+        return "\n".join(lines)
+
+    if name == "type_hierarchy":
+        direction = args.get("direction") or "both"
+        if direction not in ("both", "supertypes", "subtypes"):
+            raise ToolError("direction must be both, supertypes or subtypes")
+        wanted = ["supertypes", "subtypes"] if direction == "both" else [direction]
+        attempts = declarations(session, args["name"])
+        path, line, column, label = attempts[0]
+
+        try:
+            items = []
+            for path, line, column, label in attempts:
+                items = lsp_request(session, path, "prepare_type_hierarchy",
+                                    position_params(session, path, line, column)) or []
+                if items:
+                    break
+        except Unsupported:
+            items = None
+
+        parts = [label]
+        if items:
+            for which in wanted:
+                found = lsp_request(session, path, f"type_hierarchy_{which}",
+                                    {"item": items[0]}) or []
+                parts.append(f"\n{which}:")
+                if not found:
+                    parts.append("  (none)")
+                for item in found:
+                    item_file, item_line, item_label = hierarchy_item(item)
+                    parts.append(f"  {item_label}")
+                    code = source_line(session, item_file, item_line)
+                    if code:
+                        parts.append(f"      {code}")
+            return "\n".join(parts)
+        if items is not None:
+            return f"{label} is not a type the server can place in a hierarchy."
+
+        # No type hierarchy on this server. Substitute what can be had honestly
+        # and say which answer came from where.
+        for which in wanted:
+            if which == "supertypes":
+                parts.append(
+                    "\nsupertypes (this server has no type hierarchy; the declaration as "
+                    "written, not resolved):"
+                )
+                parts.append(peek(session, path, line, 0, 1))
+                continue
+            parts.append("\nsubtypes (from textDocument/implementation; this server has no type hierarchy):")
+            if not type(session.server).supports_implementation_request():
+                parts.append("  unavailable: this server supports neither")
+                continue
+            implementations = session.server.request_implementation(path, line, column) or []
+            if not implementations:
+                parts.append("  (none found)")
+            for implementation in implementations:
+                where = location_of(implementation)
+                file = to_relative(implementation.get("location") or implementation)
+                start = ((implementation.get("range") or {}).get("start") or {}).get("line", 0)
+                parts.append(f"  {where}")
+                code = source_line(session, file, start)
+                if code:
+                    parts.append(f"      {code}")
+        return "\n".join(parts)
+
+    if name == "code_action":
+        return code_action(session, args)
+
     raise ToolError(f"unknown tool: {name}")
+
+
+def code_action(session: LanguageServerSession, args: dict) -> str:
+    """List, preview or apply the language server's code actions for a line range."""
+    target = repo_file(args["file"])
+    lines = file_lines(session, target)
+    first = int(args["line"]) - 1
+    last = int(args.get("end_line") or args["line"]) - 1
+    if not (0 <= first <= last < len(lines)):
+        raise ToolError(f"{target} has {len(lines)} lines; {first + 1}-{last + 1} is out of range")
+    span = {
+        "start": {"line": first, "character": 0},
+        "end": {"line": last, "character": utf16_units(lines[last])},
+    }
+
+    # Quick fixes hang off diagnostics: tsserver computes a fix only for the
+    # error codes it is handed in the context, so they have to be sent along.
+    diagnostics = [
+        d for d in file_diagnostics(session, target, 4)
+        if first <= ((d.get("range") or {}).get("start") or {}).get("line", -1) <= last
+    ]
+    kind = args.get("kind")
+    context: dict = {"diagnostics": diagnostics, "triggerKind": 1}
+    if kind:
+        context["only"] = [kind]
+    uri = session.server._resolve_file_uri(target)
+    try:
+        actions = lsp_request(session, target, "code_action",
+                              {"textDocument": {"uri": uri}, "range": span, "context": context}) or []
+    except Unsupported:
+        raise ToolError(
+            f"the {session.language} language server does not support textDocument/codeAction"
+        ) from None
+    # Filtered here as well: Roslyn ignores `only` and returns everything.
+    if kind:
+        actions = [a for a in actions
+                   if (a.get("kind") or "") == kind or (a.get("kind") or "").startswith(kind + ".")]
+
+    where = f"{target}:{first + 1}" + (f"-{last + 1}" if last != first else "")
+    if not actions:
+        return (
+            f"No code actions at {where}"
+            + (f" of kind {kind!r}" if kind else "")
+            + (". Diagnostics there: " + "; ".join(d.get("message", "") for d in diagnostics)
+               if diagnostics else ".")
+        )
+
+    def runs_a_command(action: dict) -> bool:
+        # A bare Command, or an action that carries only a command: the change
+        # happens inside the server, where it cannot be previewed.
+        return isinstance(action.get("command"), str) or (
+            not action.get("edit") and action.get("data") is None and action.get("command")
+        )
+
+    title = args.get("title")
+    if not title:
+        rows = [f"{len(actions)} code action(s) at {where}:"]
+        shown: set[str] = set()
+        for diagnostic in diagnostics:
+            line_no = ((diagnostic.get("range") or {}).get("start") or {}).get("line", 0)
+            code = f" [{diagnostic['code']}]" if diagnostic.get("code") else ""
+            row = f"  for L{line_no + 1}{code}: {diagnostic.get('message')}"
+            # Roslyn reports a missing type once per mention on the line.
+            if row not in shown:
+                shown.add(row)
+                rows.append(row)
+        for action in actions:
+            note = "  (runs a server command; cannot be applied here)" if runs_a_command(action) else ""
+            rows.append(f"  - {action.get('title')} [{action.get('kind') or 'command'}]{note}")
+        rows.append("\nPass title to preview one; add apply=true to write it.")
+        return "\n".join(rows)
+
+    exact = [a for a in actions if a.get("title") == title]
+    matches = exact or [a for a in actions if title.lower() in (a.get("title") or "").lower()]
+    if len(matches) != 1:
+        listed = "\n".join(f"  - {a.get('title')}" for a in (matches or actions))
+        raise ToolError(
+            f"{'no' if not matches else len(matches)} action(s) match {title!r} at {where}:\n{listed}"
+        )
+    action = matches[0]
+
+    if not action.get("edit") and action.get("data") is not None:
+        # Roslyn returns only a handle and computes the edit on resolve.
+        action = lsp_request(session, target, "resolve_code_action", action) or action
+    edit = action.get("edit")
+    if not edit:
+        raise ToolError(
+            f"{action.get('title')!r} runs a command inside the language server rather "
+            "than returning an edit, so it cannot be previewed or applied here"
+        )
+
+    steps = edit_steps(edit)
+    total = sum(len(s[2]) for s in steps if s[0] == "edit")
+    files = {s[1] for s in steps if s[0] == "edit"}
+    summary = [f"{action.get('title')}: {total} edit(s) in {len(files)} file(s)."]
+    summary += [row for row in describe_steps(steps) if row.lstrip().startswith("renames")]
+    # The diff, not a list of line numbers: the change is small and the agent
+    # has to judge it before applying, which a coordinate cannot support.
+    summary.append(preview_steps(session.root, steps))
+
+    if not args.get("apply"):
+        summary.append("\nDry run — nothing written. Re-run with apply=true to perform it.")
+        return "\n".join(summary)
+
+    written, _unchanged, failed = apply_steps(session.root, steps)
+    session.sync_with_disk()
+    if failed:
+        raise ToolError("\n".join(summary + ["Failed to write:"] + failed))
+    if not written:
+        raise ToolError("\n".join(summary + ["Nothing was written: the files already matched."]))
+    summary.append(f"\nWritten: {written} file(s). Run check on them to confirm the result compiles.")
+    return "\n".join(summary)
 
 
 def send(message: dict) -> None:
