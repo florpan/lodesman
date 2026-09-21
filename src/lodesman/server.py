@@ -304,28 +304,54 @@ def detect_language(root: Path) -> str:
 JAVA_METHODS_IN_SYMBOL_SEARCH = True
 
 
-def include_java_methods(server: SolidLanguageServer) -> None:
+def adjust_initialize_params(server: SolidLanguageServer, adjust, what: str) -> None:
     """
-    Make jdtls index method declarations for workspace/symbol.
+    Change one setting in this server instance's initialize parameters.
 
-    Wraps this one instance's initialize parameters rather than editing the
+    Wraps the instance's _create_initialize_params rather than editing the
     vendored tree (workdocs/VENDORING.md, preference 2). Written against
-    SolidLSP at oraios/serena 704e8c3d. If that method is renamed, or the settings are
-    reshaped, this logs and leaves jdtls at its default: Java methods then
-    cannot be found by name, which is how it was before this was written.
+    SolidLSP at oraios/serena 704e8c3d. If that method is renamed or the
+    parameters are reshaped, this logs and leaves the server at its default,
+    which is how it behaved before the adjustment existed.
     """
     build = server._create_initialize_params
 
-    def with_methods():
+    def adjusted():
         params = build()
         try:
-            java = params["initializationOptions"]["settings"]["java"]
-            java.setdefault("symbols", {})["includeSourceMethodDeclarations"] = True
-        except (KeyError, TypeError) as exc:
-            log(f"could not enable Java method search (jdtls default kept): {exc!r}")
+            adjust(params)
+        except (KeyError, TypeError, AttributeError) as exc:
+            log(f"could not {what} (server default kept): {exc!r}")
         return params
 
-    server._create_initialize_params = with_methods
+    server._create_initialize_params = adjusted
+
+
+def include_java_methods(server: SolidLanguageServer) -> None:
+    """Make jdtls index method declarations for workspace/symbol."""
+    def adjust(params: dict) -> None:
+        java = params["initializationOptions"]["settings"]["java"]
+        java.setdefault("symbols", {})["includeSourceMethodDeclarations"] = True
+    adjust_initialize_params(server, adjust, "enable Java method search")
+
+
+def rename_without_aliases(server: SolidLanguageServer) -> None:
+    """
+    Make tsserver rename a symbol, rather than rename it and re-export it under
+    the old name.
+
+    With tsserver's default `providePrefixAndSuffixTextForRename`, renaming
+    `BookUpdateDto` to `BookPatch` turned a re-export into
+    `BookPatch as BookUpdateDto`, so every importer of that module kept the old
+    name. Measured on CalibreManager, 3 renames out of 3: two agents noticed and
+    spent ~20 calls cleaning up by hand, and one reported "renamed everywhere"
+    over the half-done rename. typescript-language-server passes
+    initializationOptions.preferences through to tsserver.
+    """
+    def adjust(params: dict) -> None:
+        options = params.setdefault("initializationOptions", {})
+        options.setdefault("preferences", {})["providePrefixAndSuffixTextForRename"] = False
+    adjust_initialize_params(server, adjust, "turn off tsserver's rename aliases")
 
 
 class LanguageServerSession:
@@ -363,6 +389,8 @@ class LanguageServerSession:
                 )
                 if self.language == "java" and JAVA_METHODS_IN_SYMBOL_SEARCH:
                     include_java_methods(server)
+                if self.language == "typescript":
+                    rename_without_aliases(server)
                 self._context = server.start_server_context()
                 self._context.__enter__()
                 server.server.on_any_notification(self._observe)
@@ -1131,6 +1159,13 @@ class ToolError(Exception):
     pass
 
 
+class NotFoundHere(ToolError):
+    """
+    This language's server has no such symbol — which says nothing about the
+    others. Raised rather than returned so dispatch asks the next language.
+    """
+
+
 def repo_file(target: str) -> str:
     """
     Validate a caller-supplied file path and return it relative to the repo.
@@ -1874,7 +1909,11 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         limit = int(args.get("limit", 25))
         hits = workspace_hits(session, query)
         if not hits:
-            return f"No symbol matching {query!r}." + sibling_project_caveat(session)
+            # Raised, not returned: returned, it was taken as the answer. In
+            # CalibreManager tsserver was asked first and its "none" for the C#
+            # class BookMappingHelper ended the search — 7 of 7 times, across
+            # three runs — while Roslyn, which knew it, was never asked.
+            raise NotFoundHere(f"No symbol matching {query!r}." + sibling_project_caveat(session))
         # Most-likely-intended first, so the ordering does not depend on Roslyn's.
         hits = rank_candidates(hits, query)
         lines = [f"{len(hits)} match(es) for {query!r}:"]
@@ -2224,6 +2263,28 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             raise ToolError("\n".join(summary))
         if not applied and not unchanged:
             raise ToolError("\n".join(summary + ["Nothing was written."]))
+
+        # What the rename did not reach. A language server renames the symbol,
+        # not comments or strings, and tsserver could leave `New as Old`
+        # re-exports. In CalibreManager an agent read this tool's success as
+        # "renamed everywhere" and said so, over ten comments and an alias
+        # still naming the old type. So the answer lists what is left.
+        old = split_symbol_name(args["name"])[1] or args["name"]
+        pattern = re.compile(rf"(?<![\w$]){re.escape(old)}(?![\w$])")
+        left = []
+        for relative in files_mentioning(session, old, limit=200):
+            for number, text in enumerate(file_lines(session, relative)):
+                if pattern.search(text):
+                    left.append(f"  {relative}:{number + 1}: {text.strip()[:120]}")
+        if left:
+            summary.append(
+                f"\nNot changed by the rename — {len(left)} line(s) still mention "
+                f"{old!r} (comments, strings, or re-exports under the old name). "
+                "Update them if the rename should cover them:"
+            )
+            summary += left[:15] + ([f"  … and {len(left) - 15} more"] if len(left) > 15 else [])
+        else:
+            summary.append(f"No other mention of {old!r} is left in the source.")
         summary.append(
             "Run get_file_diagnostics on an affected file to confirm the project still builds."
         )
@@ -2875,13 +2936,22 @@ def dispatch(pool: LanguageServerPool, tool: str, args: dict) -> str:
     # can answer, rather than the last, which is usually the least relevant
     # language's complaint.
     first_error: ToolError | None = None
+    not_found: list[tuple[str, NotFoundHere]] = []
     for session in pool.ordered():
         try:
             return call_tool(session, tool, args)
+        except NotFoundHere as exc:
+            not_found.append((session.language, exc))
         except ToolError as exc:
             if first_error is None:
                 first_error = exc
-            continue
+    # "Not found" is an answer only once every language has given it; then it
+    # is a normal result, not an error, and says which languages were asked.
+    # A real failure in any language outranks it: that one may have known.
+    if first_error is None and not_found:
+        asked = ", ".join(language for language, _ in not_found)
+        details = "\n".join(str(exc) for _, exc in not_found)
+        return f"Not found in any language served here ({asked}).\n{details}"
     raise first_error or ToolError(f"no language server could answer {tool}")
 
 

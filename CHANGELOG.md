@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Three fixes found by an A/B test of Claude Code with and without Lodesman on
+a real repository: CalibreManager, with a C# backend and a React-TS frontend.
+
+- **`find_symbol` in a multi-language repository answered "No symbol matching"
+  for symbols that exist.** Languages are asked in turn, and the first one's
+  "none" was taken as the answer. TypeScript went first and had never heard of
+  the C# class, which happened 7 times out of 7. A "none" now falls through to
+  the next language. It is only reported once every language has said so, and
+  the answer names the languages that were asked.
+- **A TypeScript rename could leave the old name exported.** tsserver's
+  default turned a re-export into `BookPatch as BookUpdateDto`, so every
+  importer kept the old name. This happened in 3 renames out of 3. tsserver
+  is now asked to rename outright.
+- **`rename_symbol` now lists what it didn't change:** the lines that still
+  mention the old name, such as comments, strings or re-exports. In the test,
+  an agent took the tool's success report as "renamed everywhere" and told
+  the user so, while ten comments and an alias still named the old type.
+
+These fixes are not yet verified by a test run.
+
 ## 0.5.0 — 2026-09-21
 
 Lodesman can now edit code as well as navigate it. Its answers also stay
