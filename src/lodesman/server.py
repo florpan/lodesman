@@ -2568,6 +2568,25 @@ def code_action(session: LanguageServerSession, args: dict) -> str:
     return "\n".join(summary)
 
 
+def files_mentioning(session: LanguageServerSession, word: str, limit: int = 25) -> list[str]:
+    """Source files of the session's language containing `word` as a whole word."""
+    pattern = re.compile(rf"(?<![\w$]){re.escape(word)}(?![\w$])")
+    found = []
+    for absolute in sorted(scan_sources(session.root, session.language)):
+        if is_project_file(absolute, session.language):
+            continue
+        try:
+            with open(absolute, encoding="utf-8", errors="replace") as handle:
+                if not pattern.search(handle.read()):
+                    continue
+        except OSError:
+            continue
+        found.append(os.path.relpath(absolute, session.root).replace(os.sep, "/"))
+        if len(found) >= limit:
+            break
+    return found
+
+
 def declaration_matches(session: LanguageServerSession, name: str, file: str | None,
                         line: int | None) -> list[tuple[str, dict, str]]:
     """
@@ -2592,6 +2611,14 @@ def declaration_matches(session: LanguageServerSession, name: str, file: str | N
                         if split_symbol_name(h.get("name", ""))[1] == leaf)
             if p
         })
+        if not files:
+            # The workspace index is the server's slowest-moving view: in CI,
+            # sourcekit-lsp found NullStore, then moments later answered the
+            # same search with nothing. And an agent often edits what it has
+            # only just written, before any index has caught up. The outline of
+            # a file comes from the file itself, so fall back to the files that
+            # mention the name and ask their outlines.
+            files = files_mentioning(session, leaf)
         if not files:
             raise ToolError(f"no declaration named {leaf!r} found in the project")
 

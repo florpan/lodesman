@@ -145,5 +145,45 @@ class TestDeletionSpan(unittest.TestCase):
                          "void A() {}\r\n\r\nvoid C() {}\r\n")
 
 
+class TestIndexFallback(unittest.TestCase):
+    """
+    Finding a declaration when the workspace index does not know it.
+
+    Seen in CI: sourcekit-lsp found NullStore, then moments later its workspace
+    search returned nothing for the same name. The fallback reads the outline
+    of each file that mentions the name, which comes from the file itself.
+    """
+
+    def test_a_declaration_is_found_when_workspace_search_is_empty(self):
+        import tempfile
+        import unittest.mock
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from lodesman import server
+
+        with tempfile.TemporaryDirectory(prefix="lodesman-fallback-") as tmp:
+            root = Path(tmp).resolve()
+            (root / "store.py").write_text("class NullStore:\n    pass\n", encoding="utf-8")
+            (root / "other.py").write_text("x = 1\n", encoding="utf-8")
+            outline = [{"name": "NullStore", "kind": 5, "parent": None,
+                        "range": span(0, 0, 1, 8), "selectionRange": span(0, 6, 0, 15)}]
+            asked: list[str] = []
+
+            def document_symbols(path: str):
+                asked.append(path)
+                return outline if path == "store.py" else []
+
+            session = SimpleNamespace(
+                root=root, language="python",
+                server=SimpleNamespace(request_document_symbols=document_symbols),
+            )
+            with unittest.mock.patch.object(server, "workspace_hits", return_value=[]):
+                matches = server.declaration_matches(session, "NullStore", None, None)
+
+        self.assertEqual([(m[0], m[2]) for m in matches], [("store.py", "NullStore")])
+        self.assertEqual(asked, ["store.py"], "only files mentioning the name are outlined")
+
+
 if __name__ == "__main__":
     unittest.main()

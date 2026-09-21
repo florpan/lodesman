@@ -827,6 +827,15 @@ SWIFT = LanguageSpec(
         "sourcekit-lsp answers from a compiled index store, so the package must "
         "be built before symbols resolve."
     ),
+    known_failures={
+        "test_sees_files_edited_on_disk":
+            "Intermittent: passed in two CI runs on 2026-09-21 and failed in a third, "
+            "where a type renamed on disk stayed invisible to workspace/symbol for 30 s. "
+            "sourcekit-lsp answers that search from its index store, which follows "
+            "disk edits on its own schedule; the file's outline, which comes from the "
+            "file, is current. The same run saw the index lose NullStore moments after "
+            "the readiness check found it.",
+    },
     files={
         "Package.swift": (
             "// swift-tools-version:5.7\n"
