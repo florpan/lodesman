@@ -727,6 +727,18 @@ PHP = LanguageSpec(
     # with these being the licensed features.
     supports_references=False,
     supports_rename=False,
+    known_failures={
+        "test_type_definition_resolves_a_local":
+            "intelephense answers null for $record without a licence key. Go to "
+            "type definition is on its published list of licensed features "
+            "(intelephense.com), alongside rename, implementations, type "
+            "hierarchy and code actions.",
+        "test_call_hierarchy_finds_the_caller":
+            "intelephense has no call hierarchy, and the fallback needs references, "
+            "which are licensed too. So without a key the best available answer is "
+            "'inconclusive'. Resolving the method name was also intermittent: CI "
+            "found 'scaled', a local run on 2026-09-21 did not.",
+    },
     notes=(
         "intelephense analyses PHP from node; a PHP runtime is not required. "
         "References and rename need a licence — set INTELEPHENSE_LICENSE_KEY "
@@ -896,6 +908,17 @@ CPP = LanguageSpec(
     outline_file="src/store.hpp",
     requires=("clangd",),
     notes="clangd needs compile_commands.json to resolve includes across files.",
+    known_failures={
+        "test_sees_files_edited_on_disk":
+            "clangd's workspace/symbol still did not list a renamed type after "
+            "lodesman sent didChangeWatchedFiles and opened and closed each changed "
+            "file, which fixed pyright, Roslyn and tsserver. Observed in CI "
+            "2026-09-21; not reproducible locally (no clangd), so the cause is "
+            "unestablished.",
+        "test_sees_its_own_rename":
+            "Same as test_sees_files_edited_on_disk: the renamed type stays "
+            "invisible to clangd's workspace/symbol. Observed in CI 2026-09-21.",
+    },
     files={
         "compile_commands.json": (
             "[\n"

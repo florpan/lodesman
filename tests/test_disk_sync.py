@@ -66,6 +66,18 @@ class TestScanSources(unittest.TestCase):
         self.write(".venv/lib/site.py")
         self.assertEqual(set(scan_sources(self.root, "python")), {str(kept)})
 
+    def test_csharp_scan_includes_project_files_and_restore_output(self):
+        # Roslyn reloads its project model only when told these changed, and
+        # the restore output lives in obj/, which the walk otherwise skips.
+        project = self.write("App.csproj", "<Project />\n")
+        source = self.write("Program.cs", "class P {}\n")
+        before = scan_sources(self.root, "csharp")
+        self.assertEqual(set(before), {str(project), str(source)})
+
+        assets = self.write("obj/project.assets.json", "{}\n")
+        self.assertEqual(disk_changes(before, scan_sources(self.root, "csharp")),
+                         [(str(assets), FILE_CREATED)])
+
     def test_an_edit_is_seen_by_the_next_scan(self):
         path = self.write("src/app.py")
         before = scan_sources(self.root, "python")

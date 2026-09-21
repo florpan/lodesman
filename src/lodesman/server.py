@@ -129,15 +129,33 @@ DiskState = dict[str, tuple[int, int]]
 FILE_CREATED, FILE_CHANGED, FILE_DELETED = 1, 2, 3
 
 
+# Files that define what a project *is*, per language. A server rebuilds its
+# project model when told they changed, and only then.
+PROJECT_FILE_SUFFIXES = {"csharp": (".csproj", ".props", ".targets")}
+
+# Written by a NuGet restore, inside obj/ — which the walk skips, so it is
+# looked for beside each .csproj instead.
+RESTORE_ASSETS = os.path.join("obj", "project.assets.json")
+
+
+PROJECT_RELOAD_TIMEOUT = 60
+
+
+def is_project_file(path: str, language: str) -> bool:
+    return path.endswith((*PROJECT_FILE_SUFFIXES.get(language, ()), os.sep + RESTORE_ASSETS))
+
+
 def scan_sources(root: Path, language: str) -> DiskState:
     """
-    Modification time and size of every source file of `language` under `root`.
+    Modification time and size of every source and project file of `language`
+    under `root`.
 
     Keyed by absolute path. os.scandir rather than os.walk plus a stat per file:
     on Windows a DirEntry carries its stat from the directory listing, so this
     costs one system call per directory rather than one per file, and it runs
     before every tool call.
     """
+    project_suffixes = PROJECT_FILE_SUFFIXES.get(language, ())
     state: DiskState = {}
     pending = [str(root)]
     while pending:
@@ -149,7 +167,9 @@ def scan_sources(root: Path, language: str) -> DiskState:
         subdirs = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
         pending += [os.path.join(directory, name) for name in walkable(subdirs)]
         for entry in entries:
-            if EXTENSION_LANGUAGES.get(os.path.splitext(entry.name)[1]) != language:
+            is_source = EXTENSION_LANGUAGES.get(os.path.splitext(entry.name)[1]) == language
+            is_project = entry.name.endswith(project_suffixes) if project_suffixes else False
+            if not (is_source or is_project):
                 continue
             try:
                 if not entry.is_file():
@@ -158,6 +178,13 @@ def scan_sources(root: Path, language: str) -> DiskState:
             except OSError:
                 continue
             state[entry.path] = (stat.st_mtime_ns, stat.st_size)
+            if entry.name.endswith(".csproj"):
+                assets = os.path.join(directory, RESTORE_ASSETS)
+                try:
+                    stat = os.stat(assets)
+                except OSError:
+                    continue  # not restored yet; appearing later reads as created
+                state[assets] = (stat.st_mtime_ns, stat.st_size)
     return state
 
 
@@ -278,6 +305,7 @@ class LanguageServerSession:
         self._context = None
         self._anchors: list = []
         self._disk: DiskState = {}
+        self._projects_reloaded = threading.Event()
         self._lock = threading.Lock()
 
     @property
@@ -302,9 +330,16 @@ class LanguageServerSession:
                 )
                 self._context = server.start_server_context()
                 self._context.__enter__()
+                server.server.on_any_notification(self._observe)
                 self._anchor_project(server)
                 self._warm_index(server)
                 self._server = server
+                # Roslyn restores a never-restored project itself while it
+                # starts, then keeps answering from the project it loaded
+                # before the restore — with no compiler diagnostics at all —
+                # until told the restore output exists. This sync is what tells
+                # it, and waits for the reload.
+                self.sync_with_disk()
                 log("language server ready")
             return self._server
 
@@ -407,6 +442,15 @@ class LanguageServerSession:
             except Exception as exc:  # noqa: BLE001
                 log(f"wait for anchor indexing failed: {exc}")
 
+    # Roslyn's log line when a project reload triggered by a watched-file change
+    # has finished. It sends no notification for this; the log is the signal.
+    RELOAD_DONE = "Completed (re)load of all projects"
+
+    def _observe(self, method: str, params) -> None:
+        """Runs alongside SolidLSP's own handlers for every server notification."""
+        if method == "window/logMessage" and self.RELOAD_DONE in str((params or {}).get("message", "")):
+            self._projects_reloaded.set()
+
     def sync_with_disk(self) -> int:
         """
         Tell the language server about every source file that changed on disk
@@ -447,8 +491,15 @@ class LanguageServerSession:
         server = self._server
         open_buffers = server.open_file_buffers
         watched, reopen = [], []
+        projects_changed = False
         for path, change in changes:
             uri = Path(path).as_uri()
+            if is_project_file(path, self.language):
+                # Not a document: opening a .csproj as one would hand it to
+                # the compiler. The watcher event is the whole signal.
+                projects_changed = True
+                watched.append({"uri": uri, "type": change})
+                continue
             buffer = open_buffers.get(uri)
             if buffer is not None and change != FILE_DELETED:
                 try:
@@ -460,8 +511,15 @@ class LanguageServerSession:
             if change != FILE_DELETED:
                 reopen.append(os.path.relpath(path, self.root).replace(os.sep, "/"))
 
+        if projects_changed:
+            self._projects_reloaded.clear()
         if watched:
             server.server.notify.did_change_watched_files({"changes": watched})
+        # Answering before the reload finishes answers from the old project
+        # model. Measured at about a second for a small project.
+        if (projects_changed and self.language == "csharp"
+                and not self._projects_reloaded.wait(PROJECT_RELOAD_TIMEOUT)):
+            log(f"project reload not confirmed within {PROJECT_RELOAD_TIMEOUT}s; continuing")
         # The watcher notification alone is not enough: typescript-language-
         # server ignores it and relies on tsserver's own disk watcher, which
         # picked up a rename within a second on some runs and not within 20 s
@@ -1226,6 +1284,36 @@ def sibling_project_caveat(session: LanguageServerSession) -> str:
     )
 
 
+def unrestored_project(root: Path, target: str) -> str | None:
+    """
+    The .csproj that owns `target`, if it has no restore output. Else None.
+
+    Roslyn reports no compiler diagnostics at all for a project it loaded
+    without obj/project.assets.json — not missing-type errors, nothing — while
+    its analyzers still run. It restores such a project itself on startup, and
+    sync_with_disk makes it reload afterwards. So by the time check runs, a
+    missing file here means that restore failed or could not run: an
+    unreachable feed, no SDK. Then "no errors" is not an answer, and
+    "no errors" on broken code is the one answer an agent acts on without
+    looking.
+
+    The owning project is the nearest .csproj walking up from the file. A
+    project that moves its intermediate output (BaseIntermediateOutputPath,
+    the artifacts layout) reads as unrestored here, which is why the warning
+    this feeds says "may".
+    """
+    directory = (root / target).parent
+    while True:
+        projects = sorted(directory.glob("*.csproj"))
+        if projects:
+            if (directory / "obj" / "project.assets.json").is_file():
+                return None
+            return str(projects[0].relative_to(root)).replace(os.sep, "/")
+        if directory == root or root not in directory.parents:
+            return None
+        directory = directory.parent
+
+
 def candidates_for(session: LanguageServerSession, name: str) -> list[dict]:
     """Ranked declarations to try for `name` — exact matches only if any exist."""
     hits = workspace_hits(session, name)
@@ -1644,8 +1732,20 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         min_severity = int(args.get("severity", 2))
         diagnostics = file_diagnostics(session, target, min_severity)
         names = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+        unrestored = unrestored_project(session.root, target) if session.language == "csharp" else None
+        not_restored = (
+            f"  WARNING: {unrestored} may never have been restored (no "
+            "obj/project.assets.json). Roslyn reports no compiler errors at all for an "
+            "unrestored project, so compile errors may be missing from this answer. "
+            "Run `dotnet restore` (or build once) and check again."
+        ) if unrestored else None
         if not diagnostics:
             scope = names.get(min_severity, "issue")
+            if not_restored:
+                return (
+                    f"{target}: the language server reported no {scope}s, but that cannot "
+                    f"be trusted here.\n{not_restored}"
+                )
             return (
                 f"{target}: no {scope}s or worse. Note this is the language server's view "
                 "of the project, not a full build."
@@ -1654,6 +1754,8 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                                         ((d.get("range") or {}).get("start") or {}).get("line") or 0))
         counts = Counter(names.get(d.get("severity"), "?") for d in diagnostics)
         rendered = [f"{target}: " + ", ".join(f"{n} {k}(s)" for k, n in counts.items())]
+        if not_restored:
+            rendered.append(not_restored)
 
         # Distinguish "your code is broken" from "the project did not load".
         # A failed NuGet restore or an unreachable feed makes the compiler lose
@@ -1910,6 +2012,26 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         budget = 60
         attempts = declarations(session, args["name"])
 
+        def from_references(reason: str) -> str:
+            # Incoming calls have an honest substitute: the symbols containing
+            # each reference, which is what blast_radius walks. It over-reports
+            # rather than under-reports — a reference that is not a call still
+            # appears — which is the safe direction to be wrong in. An empty
+            # result here is never "nothing calls it": in CI, intelephense
+            # without a licence had neither calls nor references, and saying
+            # "a leaf" there would be a confident false answer.
+            text = call_tool(session, "blast_radius",
+                             {"name": args["name"], "depth": depth, "max_queries": budget})
+            if text.startswith("Nothing references"):
+                return (
+                    f"{reason} Its references found nothing either. Treat this as "
+                    "inconclusive rather than as proof that nothing calls it."
+                )
+            return (
+                f"{reason} Showing the symbols that reference it instead, which also "
+                f"includes references that are not calls:\n\n{text}"
+            )
+
         root_item, root_label = None, attempts[0][3]
         try:
             for path, line, column, label in attempts:
@@ -1925,21 +2047,13 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                     "outgoing calls are not available. get_symbol_body shows the body, "
                     "and with it what it calls."
                 ) from None
-            # Incoming has an honest substitute: the symbols containing each
-            # reference. It is what blast_radius walks, and it over-reports
-            # rather than under-reports — a reference that is not a call still
-            # appears — which is the safe direction to be wrong in.
-            text = call_tool(session, "blast_radius",
-                             {"name": args["name"], "depth": depth, "max_queries": budget})
-            return (
-                f"The {session.language} language server has no call hierarchy. Showing "
-                "the symbols that reference it instead, which also includes references "
-                "that are not calls:\n\n" + text
-            )
+            return from_references(f"The {session.language} language server has no call hierarchy.")
         if root_item is None:
+            if direction == "incoming":
+                return from_references(f"The server offers no call hierarchy for {root_label}.")
             return (
                 f"{root_label} is not something that is called — the server offers no "
-                "call hierarchy for it. Use find_references for other kinds of usage."
+                "call hierarchy for it. get_symbol_body shows what it contains."
             )
 
         method = "incoming_calls" if direction == "incoming" else "outgoing_calls"
@@ -1974,12 +2088,12 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
 
         expand(root_item, 1, "  ")
         if len(lines) == 1:
-            return (
-                f"No {'callers' if direction == 'incoming' else 'calls'} found for "
-                f"{root_label}. For incoming, it may be reached only through an "
-                "interface, a delegate, reflection or DI, which call edges cannot see; "
-                "find_references and find_implementations cover those."
-            )
+            if direction == "incoming":
+                # Observed in CI: sourcekit-lsp prepared the item and then
+                # reported no callers of a method that has one. "No callers"
+                # from one source is not believed without asking another.
+                return from_references(f"The call hierarchy reported no callers of {root_label}.")
+            return f"No calls found in {root_label}."
         if queries >= budget:
             lines.append("Query budget reached — the real hierarchy is larger than shown.")
         return "\n".join(lines)
@@ -2001,6 +2115,8 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                     break
         except Unsupported:
             items = None
+        if not items:
+            path, line, column, label = attempts[0]  # the loop left the last one tried
 
         parts = [label]
         if items:
@@ -2017,20 +2133,19 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                     if code:
                         parts.append(f"      {code}")
             return "\n".join(parts)
-        if items is not None:
-            return f"{label} is not a type the server can place in a hierarchy."
 
-        # No type hierarchy on this server. Substitute what can be had honestly
+        # No type hierarchy for this type: the server lacks the method, or —
+        # observed in CI for ruby-lsp and intelephense — has it and returns
+        # nothing for a plain interface. Substitute what can be had honestly
         # and say which answer came from where.
+        why = ("this server has no type hierarchy" if items is None
+               else "the server gave no type hierarchy for it")
         for which in wanted:
             if which == "supertypes":
-                parts.append(
-                    "\nsupertypes (this server has no type hierarchy; the declaration as "
-                    "written, not resolved):"
-                )
+                parts.append(f"\nsupertypes ({why}; the declaration as written, not resolved):")
                 parts.append(peek(session, path, line, 0, 1))
                 continue
-            parts.append("\nsubtypes (from textDocument/implementation; this server has no type hierarchy):")
+            parts.append(f"\nsubtypes (from textDocument/implementation; {why}):")
             if not type(session.server).supports_implementation_request():
                 parts.append("  unavailable: this server supports neither")
                 continue

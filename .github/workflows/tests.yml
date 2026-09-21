@@ -143,6 +143,27 @@ jobs:
             fi
           fi
 
+      # Tests that need a per-language scenario rather than the shared
+      # fixture. Skips fail here too: CI installs what they need on purpose.
+      - name: Run the language-specific tests
+        if: matrix.language == 'csharp' || matrix.language == 'typescript'
+        env:
+          LODESMAN_INTEGRATION: "1"
+        run: |
+          case "${{ matrix.language }}" in
+            csharp) tests="tests.integration.test_code_actions.TestCSharp tests.integration.test_check" ;;
+            typescript) tests="tests.integration.test_code_actions.TestTypeScript" ;;
+          esac
+          python -m unittest -v $tests 2>&1 | tee extra.log || true
+          if grep -qE "^(FAILED|ERROR)" extra.log; then
+            echo "::error::${{ matrix.language }} language-specific tests failed"
+            exit 1
+          fi
+          if grep -qE "skipped|^Ran 0 tests" extra.log; then
+            echo "::error::${{ matrix.language }} language-specific tests skipped instead of running"
+            exit 1
+          fi
+
   # Verifies the published package rather than the working tree, so a
   # packaging mistake that never shows up from a checkout still gets caught.
   published:

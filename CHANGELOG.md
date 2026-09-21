@@ -32,6 +32,23 @@ Where a server lacks one, the tool falls back, and the answer says so.
 - **`type_hierarchy`, subtypes:** uses `textDocument/implementation`.
 - **`type_hierarchy`, supertypes:** shows the declaration line as written.
 
+### `check` said "no errors" about broken C# in a fresh clone
+
+On a project that had never been built, `check` answered **"no errors"** for a
+file with plain compile errors. Roslyn restores such a project itself while it
+starts up. It keeps using the project it loaded before that restore, and that
+project yields no compiler diagnostics at all (its analyzers still run). In
+VS Code the file watcher reports the restore output and Roslyn reloads; here
+nothing did.
+
+The disk sync now also watches project files (`.csproj`, `.props`,
+`.targets`) and each project's `obj/project.assets.json`. When one changes,
+the sync waits for Roslyn to confirm it has reloaded. It also runs once right
+after startup, which covers Roslyn's own restore. If the restore itself fails,
+for example because a package feed is unreachable, `check` now says its
+answer cannot be trusted and suggests `dotnet restore`. Before, it reported
+clean.
+
 ### `rename_symbol` dropped file renames
 
 jdtls renames a Java class by renaming its file too, since Java requires the

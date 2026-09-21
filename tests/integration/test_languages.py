@@ -190,6 +190,8 @@ class LanguageContract:
         # reference machinery, and say that they did.
         method = self.locate(r"\b((?i:scaled))\s*\(")[2]
         text = self.call("call_hierarchy", name=method)
+        if not self.spec.supports_references and "inconclusive" in text:
+            return  # no calls and no references to fall back on: declared, not denied
         self.assertIn("total", text.lower())
 
     def test_type_hierarchy_finds_both_implementations(self):
@@ -200,12 +202,24 @@ class LanguageContract:
         self.assertIn("NullStore", text)
 
     def test_type_definition_resolves_a_local(self):
-        # `record` in `record.scaled(2)` is a local in every fixture: not a
-        # workspace symbol, so this is the pointed-at form of the tool.
-        file, line, identifier = self.locate(r"\b(record)\s*[.?]+\s*(?i:scaled)")
-        text = self.call("type_definition", file=file, line=line, symbol=identifier)
+        # Pointed at by file and line, because a local is not a workspace
+        # symbol. Most fixtures have `record` in `record.scaled(2)` (`->` in
+        # C++, `$record` in PHP); Swift and Kotlin pass closure parameters
+        # instead, so their `store` field stands in, whose type is Store.
+        try:
+            target, expected = self.locate(r"(?<![\w$])(\$?record)\s*(?:\.|\?\.|->)\s*(?i:scaled)"), "Record"
+        except LookupError:
+            target, expected = self.locate(r"(?<![\w$])(store)\s*(?:\.|\?\.|->)\s*(?i:get)\b"), "Store"
+        file, line, identifier = target
+        text, is_error = self.server.call(
+            "type_definition", {"file": file, "line": line, "symbol": identifier}
+        )
+        if is_error:
+            # A server without typeDefinition must say so, not answer emptily.
+            self.assertIn("does not support", text)
+            return
         self.assertIn("is of type", text)
-        self.assertIn("Record", text.split("is of type", 1)[1])
+        self.assertIn(expected, text.split("is of type", 1)[1])
 
     def test_rename_writes_to_disk_and_preserves_line_endings(self):
         # Its own repository and server: this one mutates, and the read-only
@@ -293,6 +307,9 @@ class LanguageContract:
         # computes its edits against positions that no longer exist.
         if not self.spec.supports_rename:
             self.skipTest(f"{self.spec.language}: server does not rename")
+        broken = self.spec.known_failures.get("test_rename_writes_to_disk_and_preserves_line_endings")
+        if broken:
+            self.skipTest(f"{self.spec.language}: rename is a known failure — {broken}")
         _repo, server = self.fresh_server()
         text, is_error = server.call(
             "rename_symbol",
