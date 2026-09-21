@@ -1319,33 +1319,59 @@ def sibling_project_caveat(session: LanguageServerSession) -> str:
     )
 
 
-def unrestored_project(root: Path, target: str) -> str | None:
+NEVER_RESTORED = "never restored"
+
+
+def restore_state(root: Path, target: str) -> tuple[str | None, str | None]:
     """
-    The .csproj that owns `target`, if it has no restore output. Else None.
+    (the .csproj that owns `target`, what is wrong with its package restore).
 
-    Roslyn reports no compiler diagnostics at all for a project it loaded
-    without obj/project.assets.json — not missing-type errors, nothing — while
-    its analyzers still run. It restores such a project itself on startup, and
-    sync_with_disk makes it reload afterwards. So by the time check runs, a
-    missing file here means that restore failed or could not run: an
-    unreachable feed, no SDK. Then "no errors" is not an answer, and
-    "no errors" on broken code is the one answer an agent acts on without
-    looking.
+    The project is None when no .csproj owns the file; the problem is None when
+    it restored cleanly, and NEVER_RESTORED when there is no restore output.
 
-    The owning project is the nearest .csproj walking up from the file. A
-    project that moves its intermediate output (BaseIntermediateOutputPath,
-    the artifacts layout) reads as unrestored here, which is why the warning
-    this feeds says "may".
+    Two failures look alike from the diagnostics and mean opposite things:
+
+    * **Never restored.** Roslyn reports no compiler diagnostics at all for a
+      project it loaded without obj/project.assets.json, so "no errors" is not
+      an answer. It restores such a project itself on startup and
+      sync_with_disk makes it reload, so by the time check runs this means
+      the restore could not run.
+    * **Restore failed.** An unreachable feed still writes project.assets.json,
+      and records the failure in its `logs`: NU1301, level Error, "Unable to
+      load the service index" (reproduced 2026-09-21 with a dead feed).
+      Types from the missing packages then report as missing — CalibreManager
+      showed 42 such errors, none real.
+
+    A clean restore logs no errors, and then CS0246 is a genuine missing
+    using, not a symptom. Guessing from the proportion of missing-type errors,
+    as check used to, told agents not to trust a real, trivially fixable error.
+
+    The owning project is the nearest .csproj walking up from the file. One
+    that moves its intermediate output (BaseIntermediateOutputPath, the
+    artifacts layout) reads as never restored, which is why the warning says
+    "may".
     """
     directory = (root / target).parent
     while True:
         projects = sorted(directory.glob("*.csproj"))
         if projects:
-            if (directory / "obj" / "project.assets.json").is_file():
-                return None
-            return str(projects[0].relative_to(root)).replace(os.sep, "/")
+            project = str(projects[0].relative_to(root)).replace(os.sep, "/")
+            assets = directory / "obj" / "project.assets.json"
+            if not assets.is_file():
+                return project, NEVER_RESTORED
+            try:
+                logs = json.loads(assets.read_text(encoding="utf-8-sig")).get("logs") or []
+            except (OSError, ValueError, AttributeError):
+                return project, "its restore output could not be read"
+            errors = [entry for entry in logs if isinstance(entry, dict)
+                      and str(entry.get("level", "")).lower() == "error"]
+            if not errors:
+                return project, None
+            first = errors[0]
+            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+            return project, f"its package restore failed: {first.get('code')} {first.get('message')}{more}"
         if directory == root or root not in directory.parents:
-            return None
+            return None, None
         directory = directory.parent
 
 
@@ -1767,19 +1793,30 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         min_severity = int(args.get("severity", 2))
         diagnostics = file_diagnostics(session, target, min_severity)
         names = {1: "error", 2: "warning", 3: "info", 4: "hint"}
-        unrestored = unrestored_project(session.root, target) if session.language == "csharp" else None
-        not_restored = (
-            f"  WARNING: {unrestored} may never have been restored (no "
-            "obj/project.assets.json). Roslyn reports no compiler errors at all for an "
-            "unrestored project, so compile errors may be missing from this answer. "
-            "Run `dotnet restore` (or build once) and check again."
-        ) if unrestored else None
+        project, problem = (restore_state(session.root, target)
+                            if session.language == "csharp" else (None, None))
+        if problem == NEVER_RESTORED:
+            restore_warning = (
+                f"  WARNING: {project} may never have been restored (no "
+                "obj/project.assets.json). Roslyn reports no compiler errors at all for an "
+                "unrestored project, so compile errors may be missing from this answer. "
+                "Run `dotnet restore` (or build once) and check again."
+            )
+        elif problem:
+            restore_warning = (
+                f"  WARNING: {project}: {problem}. Types from packages that did not "
+                "restore report as missing, so missing-type errors (CS0246, CS0234) may "
+                "not be real. Fix the restore and check again before changing code."
+            )
+        else:
+            restore_warning = None
+
         if not diagnostics:
             scope = names.get(min_severity, "issue")
-            if not_restored:
+            if restore_warning:
                 return (
                     f"{target}: the language server reported no {scope}s, but that cannot "
-                    f"be trusted here.\n{not_restored}"
+                    f"be trusted here.\n{restore_warning}"
                 )
             return (
                 f"{target}: no {scope}s or worse. Note this is the language server's view "
@@ -1789,24 +1826,22 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                                         ((d.get("range") or {}).get("start") or {}).get("line") or 0))
         counts = Counter(names.get(d.get("severity"), "?") for d in diagnostics)
         rendered = [f"{target}: " + ", ".join(f"{n} {k}(s)" for k, n in counts.items())]
-        if not_restored:
-            rendered.append(not_restored)
-
-        # Distinguish "your code is broken" from "the project did not load".
-        # A failed NuGet restore or an unreachable feed makes the compiler lose
-        # the core assemblies, and it then reports every tuple and every base
-        # type as undefined. Observed on CalibreManager, which references a
-        # private feed that is not reachable: 42 phantom errors, none real. An
-        # agent told to fix those would edit correct code.
-        broken_project_codes = {"CS8179", "CS0518", "CS0012", "CS1069", "CS0246", "CS0234"}
-        suspect = sum(1 for d in diagnostics if str(d.get("code")) in broken_project_codes)
-        if suspect and suspect >= len(diagnostics) / 2:
-            rendered.append(
-                f"  WARNING: {suspect} of {len(diagnostics)} are missing-type/assembly errors. "
-                "That usually means the project did not load fully (failed or incomplete "
-                "package restore), not that the code is wrong. Verify with a real build "
-                "before changing anything."
-            )
+        if restore_warning:
+            rendered.append(restore_warning)
+        elif session.language == "csharp" and project is None:
+            # No .csproj owns the file, so the restore cannot be inspected.
+            # Only then fall back to guessing from the mix of errors: a lost
+            # restore reports every package type as missing (CalibreManager,
+            # 42 phantom errors), but so does a plain missing using.
+            broken_project_codes = {"CS8179", "CS0518", "CS0012", "CS1069", "CS0246", "CS0234"}
+            suspect = sum(1 for d in diagnostics if str(d.get("code")) in broken_project_codes)
+            if suspect and suspect >= len(diagnostics) / 2:
+                rendered.append(
+                    f"  WARNING: {suspect} of {len(diagnostics)} are missing-type/assembly "
+                    "errors and no .csproj owns this file, so its restore cannot be "
+                    "checked. That can mean the project did not load fully rather than "
+                    "that the code is wrong. Verify with a real build."
+                )
         for item in diagnostics[: int(args.get("limit", 40))]:
             start = (item.get("range") or {}).get("start") or {}
             line = start.get("line")

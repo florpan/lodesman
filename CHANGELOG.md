@@ -59,10 +59,27 @@ nothing did.
 The disk sync now also watches project files (`.csproj`, `.props`,
 `.targets`) and each project's `obj/project.assets.json`. When one changes,
 the sync waits for Roslyn to confirm it has reloaded. It also runs once right
-after startup, which covers Roslyn's own restore. If the restore itself fails,
-for example because a package feed is unreachable, `check` now says its
-answer cannot be trusted and suggests `dotnet restore`. Before, it reported
-clean.
+after startup, which covers Roslyn's own restore.
+
+### `check` no longer guesses whether the project loaded
+
+`check` used to warn that the project "did not load fully, not that the code
+is wrong" whenever at least half of a file's errors were missing-type errors
+(CS0246 and similar). That is also exactly what a plain missing `using` looks
+like, so a real, trivially fixable error came with advice not to trust it.
+
+`check` now reads the owning project's restore state instead of guessing:
+
+- **Never restored** (no `obj/project.assets.json`): compile errors may be
+  missing from the answer. Run `dotnet restore`.
+- **Restore failed**: `check` names the failure. A failed restore still writes
+  `project.assets.json` and records the error in it, for example
+  `NU1301 Unable to load the service index` from an unreachable feed.
+  Missing-type errors may then be phantoms.
+- **Restored cleanly**: no warning. A CS0246 is reported as the missing `using`
+  it is, and `code_action` can add it.
+
+The old guess remains only for a file that no `.csproj` owns.
 
 ### `rename_symbol` dropped file renames
 
