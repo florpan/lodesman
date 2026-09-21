@@ -282,7 +282,12 @@ class LanguageContract:
         file = re.search(r"— (\S+):\d+\.", text).group(1)
         lines = (repo / file).read_text(encoding="utf-8").splitlines()
         at = next(i for i, line in enumerate(lines) if "before-marker" in line)
-        self.assertIn("NullStore", lines[at + 1])
+        # Directly above the declaration — or above its attributes, which
+        # belong to it: Rust's `#[derive(Default)]` sits between the two.
+        declaration = next(i for i in range(at + 1, len(lines)) if "NullStore" in lines[i])
+        for between in lines[at + 1:declaration]:
+            self.assertTrue(between.strip().startswith(("#[", "@", "[", "//", "/*", "*", "#")),
+                            f"inserted away from the declaration: {between!r} is in between")
 
         method = self.scaled_method()
         text, is_error = server.call(

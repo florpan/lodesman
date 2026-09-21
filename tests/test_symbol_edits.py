@@ -20,11 +20,13 @@ from lodesman.server import (
     apply_edits_to_text,
     as_block,
     bare_name,
+    containers,
     deletion_span,
     last_line_of,
     leading_block_start,
     name_path,
     range_text,
+    split_symbol_name,
 )
 
 
@@ -39,6 +41,30 @@ class TestNames(unittest.TestCase):
         self.assertEqual(bare_name("scaled(int) : int"), "scaled")
         self.assertEqual(bare_name("List<T>"), "List")
         self.assertEqual(bare_name("plain"), "plain")
+
+    def test_server_spellings_split_into_container_and_name(self):
+        cases = {
+            # gopls outline: receiver-qualified, top level (symbols.go)
+            "(*MemoryStore).Get": (["MemoryStore"], "Get", False),
+            "(NullStore).Get": (["NullStore"], "Get", False),
+            "(*Cache[K]).Put": (["Cache"], "Put", False),
+            # gopls workspace search: qualified by type (and package)
+            "store.MemoryStore.Get": (["store", "MemoryStore"], "Get", False),
+            # rust-analyzer impl blocks stand for their type as containers
+            "impl Record": ([], "Record", True),
+            "impl Store for MemoryStore": ([], "MemoryStore", True),
+            "impl<T> Store for Cache<T>": ([], "Cache", True),
+            # signatures appended by Roslyn and jdtls
+            "Get(string)": ([], "Get", False),
+            "scaled(int) : int": ([], "scaled", False),
+        }
+        for raw, expected in cases.items():
+            with self.subTest(name=raw):
+                self.assertEqual(split_symbol_name(raw), expected)
+
+    def test_an_impl_block_contributes_its_type_to_the_chain(self):
+        impl = {"name": "impl Record", "parent": {"name": "fixture", "parent": None}}
+        self.assertEqual(containers({"name": "scaled", "parent": impl}), ["fixture", "Record"])
 
     def test_every_qualifier_separator_means_the_same(self):
         for name in ("MemoryStore.get", "MemoryStore/get", "MemoryStore::get"):

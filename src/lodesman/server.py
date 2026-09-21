@@ -1686,12 +1686,40 @@ def name_path(name: str) -> list[str]:
     return [part for part in re.split(r"::|\.|/", name or "") if part]
 
 
+def split_symbol_name(name: str) -> tuple[list[str], str, bool]:
+    """
+    A symbol name as servers spell it, as (qualifiers, name, is_impl_block).
+
+    Servers put more than the name in `name`, each differently:
+
+    * gopls names a method by its receiver, and lists it at the top level of
+      the outline rather than under its type: "(*MemoryStore).Get",
+      "(NullStore).Get" (gopls/internal/golang/symbols.go). Its workspace
+      search qualifies instead: "MemoryStore.Get".
+    * rust-analyzer groups methods under their impl block, named
+      "impl Record" or "impl Store for MemoryStore". Such a block is not a
+      declaration of its own but stands for its type as a container — so
+      `Record.scaled` finds the method in `impl Record`.
+    * Roslyn and jdtls append signatures: "Get(string)", "scaled(int) : int".
+    """
+    name = (name or "").strip()
+    receiver = re.match(r"^\(\*?([\w.]+)(?:\[[^\]]*\])?\)\.(\w+)", name)
+    if receiver:
+        return [receiver.group(1).split(".")[-1]], receiver.group(2), False
+    impl = re.match(r"^impl(?:<.*?>)?\s+(?:.+?\s+for\s+)?([\w:]+)", name)
+    if impl:
+        return [], impl.group(1).split("::")[-1], True
+    parts = name_path(bare_name(name))
+    return parts[:-1], (parts[-1] if parts else ""), False
+
+
 def containers(symbol: dict) -> list[str]:
     """Names of the symbols enclosing `symbol`, outermost first."""
     chain = []
     parent = symbol.get("parent")
     while parent:
-        chain.append(bare_name(parent.get("name", "")))
+        qualifiers, leaf, _impl = split_symbol_name(parent.get("name", ""))
+        chain += [leaf, *qualifiers[::-1]]
         parent = parent.get("parent")
     return chain[::-1]
 
@@ -2541,7 +2569,8 @@ def declaration_matches(session: LanguageServerSession, name: str, file: str | N
     else:
         files = sorted({
             p for p in (to_relative(h.get("location") or {})
-                        for h in workspace_hits(session, leaf) if bare_name(h.get("name", "")) == leaf)
+                        for h in workspace_hits(session, leaf)
+                        if split_symbol_name(h.get("name", ""))[1] == leaf)
             if p
         })
         if not files:
@@ -2550,9 +2579,10 @@ def declaration_matches(session: LanguageServerSession, name: str, file: str | N
     matches = []
     for candidate_file in files:
         for symbol in symbols_of(session.server.request_document_symbols(candidate_file)):
-            if bare_name(symbol.get("name", "")) != leaf or not symbol.get("range"):
+            own, symbol_leaf, impl_block = split_symbol_name(symbol.get("name", ""))
+            if impl_block or symbol_leaf != leaf or not symbol.get("range"):
                 continue
-            chain = containers(symbol)
+            chain = [*containers(symbol), *own]
             if qualifiers and chain[-len(qualifiers):] != qualifiers:
                 continue
             matches.append((candidate_file, symbol, ".".join([*chain, leaf])))
@@ -2646,7 +2676,11 @@ def refuse_if_used(session: LanguageServerSession, path: str, symbol: dict,
              *rows, *more]
         ))
 
-    pattern = re.compile(rf"(?<![\w$]){re.escape(bare_name(symbol.get('name', '')))}(?![\w$])")
+    leaf = split_symbol_name(symbol.get("name", ""))[1]
+    if not leaf:
+        raise ToolError(f"Not deleted: could not tell what {qualified} is called, so its "
+                        "usages cannot be searched for.")
+    pattern = re.compile(rf"(?<![\w$]){re.escape(leaf)}(?![\w$])")
     mentions = []
     for absolute in sorted(scan_sources(session.root, session.language)):
         if is_project_file(absolute, session.language):
