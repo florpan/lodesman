@@ -1453,8 +1453,27 @@ def restore_state(root: Path, target: str) -> tuple[str | None, str | None]:
 
 
 def candidates_for(session: LanguageServerSession, name: str) -> list[dict]:
-    """Ranked declarations to try for `name` — exact matches only if any exist."""
+    """
+    Ranked declarations to try for `name` — exact matches only if any exist.
+
+    Falls back to file outlines when the workspace index has nothing. CI saw
+    sourcekit-lsp lose NullStore from its workspace search moments after
+    finding it, three runs in a row, each time failing a different tool —
+    rename, safe_delete, a disk-edit check — because every tool that takes a
+    name starts here. The outlines come from the files, not from the index.
+    """
     hits = workspace_hits(session, name)
+    if not hits:
+        try:
+            matches = declaration_matches(session, name, None, None)
+        except ToolError:
+            matches = []
+        hits = [{
+            "name": split_symbol_name(symbol.get("name", ""))[1],
+            "kind": symbol.get("kind"),
+            "selectionRange": symbol.get("selectionRange") or symbol["range"],
+            "location": {"uri": session.server._resolve_file_uri(path), "range": symbol["range"]},
+        } for path, symbol, _qualified in matches]
     if not hits:
         raise ToolError(f"no symbol named {name!r} found in the project")
     exact = [h for h in hits if h.get("name") == name]

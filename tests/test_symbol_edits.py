@@ -184,6 +184,38 @@ class TestIndexFallback(unittest.TestCase):
         self.assertEqual([(m[0], m[2]) for m in matches], [("store.py", "NullStore")])
         self.assertEqual(asked, ["store.py"], "only files mentioning the name are outlined")
 
+    def test_every_name_based_tool_gets_the_fallback(self):
+        # rename_symbol, find_references and the rest start at candidates_for;
+        # the rename test failed in CI exactly as safe_delete had.
+        import tempfile
+        import unittest.mock
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from lodesman import server
+
+        with tempfile.TemporaryDirectory(prefix="lodesman-fallback-") as tmp:
+            root = Path(tmp).resolve()
+            (root / "store.py").write_text("class NullStore:\n    pass\n", encoding="utf-8")
+            outline = [{"name": "NullStore", "kind": 5, "parent": None,
+                        "range": span(0, 0, 1, 8), "selectionRange": span(0, 6, 0, 15)}]
+            session = SimpleNamespace(
+                root=root, language="python",
+                server=SimpleNamespace(
+                    request_document_symbols=lambda path: outline if path == "store.py" else [],
+                    _resolve_file_uri=lambda path: (root / path).as_uri(),
+                ),
+            )
+            with unittest.mock.patch.object(server, "workspace_hits", return_value=[]), \
+                    unittest.mock.patch.object(server, "_ROOT", root):
+                candidates = server.candidates_for(session, "NullStore")
+                where = server.to_relative(candidates[0]["location"])
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(where, "store.py")
+        # The position tools act on is the name, not the start of the class.
+        self.assertEqual(server.position_of(candidates[0]), (0, 6))
+
 
 if __name__ == "__main__":
     unittest.main()
