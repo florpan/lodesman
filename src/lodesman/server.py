@@ -2394,49 +2394,54 @@ def call_tool(session: LanguageServerSession, name: str, args: dict,
         if not items:
             path, line, column, label = attempts[0]  # the loop left the last one tried
 
-        parts = [label]
-        if items:
-            for which in wanted:
-                found = lsp_request(session, path, f"type_hierarchy_{which}",
-                                    {"item": items[0]}) or []
-                parts.append(f"\n{which}:")
-                if not found:
-                    parts.append("  (none)")
-                for item in found:
-                    item_file, item_line, item_label = hierarchy_item(item)
-                    if item_file:
-                        item_label = f"{addresser.at(item_file, item_line)}  {kind_of(item)}"
-                    parts.append(f"  {item_label}")
-                    code = source_line(session, item_file, item_line)
-                    if code:
-                        parts.append(f"      {code}")
-            return "\n".join(parts)
+        def rendered(items_found: list) -> list[str]:
+            rows = []
+            for item in items_found:
+                item_file, item_line, item_label = hierarchy_item(item)
+                if item_file:
+                    item_label = f"{addresser.at(item_file, item_line)}  {kind_of(item)}"
+                rows.append(f"  {item_label}")
+                code = source_line(session, item_file, item_line)
+                if code:
+                    rows.append(f"      {code}")
+            return rows
 
-        # No type hierarchy for this type: the server lacks the method, or —
-        # observed in CI for ruby-lsp and intelephense — has it and returns
-        # nothing for a plain interface. Substitute what can be had honestly
-        # and say which answer came from where.
-        why = ("this server has no type hierarchy" if items is None
-               else "the server gave no type hierarchy for it")
-        for which in wanted:
+        def substitute(which: str, why: str) -> list[str]:
+            """
+            What can be had without the type hierarchy, said as what it is.
+
+            An empty answer from one source is not proof: ruby-lsp answers
+            prepare_type_hierarchy for a class and then reports no subtypes,
+            while textDocument/implementation finds both of them.
+            """
             if which == "supertypes":
-                parts.append(f"\nsupertypes ({why}; the declaration as written, not resolved):")
-                parts.append(peek(session, path, line, 0, 1))
-                continue
-            parts.append(f"\nsubtypes (from textDocument/implementation; {why}):")
+                return [f"\nsupertypes ({why}; the declaration as written, not resolved):",
+                        peek(session, path, line, 0, 1)]
+            rows = [f"\nsubtypes (from textDocument/implementation; {why}):"]
             if not type(session.server).supports_implementation_request():
-                parts.append("  unavailable: this server supports neither")
-                continue
+                return [*rows, "  unavailable: this server supports neither"]
             implementations = session.server.request_implementation(path, line, column) or []
             if not implementations:
-                parts.append("  (none found)")
+                return [*rows, "  (none found)"]
             for implementation in implementations:
                 file = to_relative(implementation.get("location") or implementation)
                 start = ((implementation.get("range") or {}).get("start") or {}).get("line", 0)
-                parts.append(f"  {addresser.at(file, start)}")
+                rows.append(f"  {addresser.at(file, start)}")
                 code = source_line(session, file, start)
                 if code:
-                    parts.append(f"      {code}")
+                    rows.append(f"      {code}")
+            return rows
+
+        parts = [label]
+        for which in wanted:
+            found = (lsp_request(session, path, f"type_hierarchy_{which}",
+                                 {"item": items[0]}) or []) if items else []
+            if found:
+                parts.append(f"\n{which}:")
+                parts += rendered(found)
+                continue
+            parts += substitute(which, "this server has no type hierarchy" if items is None
+                                else "the server's type hierarchy reported none")
         return "\n".join(parts)
 
     if name == "code_action":

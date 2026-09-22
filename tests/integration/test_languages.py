@@ -382,6 +382,7 @@ class LanguageContract:
             text, is_error = server.call("find_symbol", {"name": name})
             if not is_error and f"No declaration named {name!r}" not in text:
                 return True
+            self.last_answer = text
             if time.time() >= deadline:
                 return False
             time.sleep(1)
@@ -400,7 +401,8 @@ class LanguageContract:
                 path.write_bytes(raw.replace(b"NullStore", b"VoidStore"))
 
         self.assertTrue(self.resolves(server, "VoidStore"),
-                        "a type added on disk never became visible")
+                        f"a type added on disk never became visible; last answer:
+{self.last_answer}")
 
     def test_sees_its_own_rename(self):
         # rename_symbol writes the files itself. A second question straight
@@ -418,7 +420,8 @@ class LanguageContract:
         )
         self.assertFalse(is_error, text)
         self.assertTrue(self.resolves(server, "VoidStore"),
-                        "the renamed symbol never became visible to the server")
+                        f"the renamed symbol never became visible; last answer:
+{self.last_answer}")
 
 
 def _make_case(spec: languages.LanguageSpec) -> type[unittest.TestCase]:
