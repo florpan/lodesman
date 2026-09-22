@@ -1938,13 +1938,37 @@ def resolve_all(pool: LanguageServerPool, address: Address, language: str | None
         return found
     # A stale index can name files that no longer declare it, which leaves no
     # empty answer for files_declaring to fall back from; so fall back here.
-    for session in [pool.session(language)] if language else pool.ordered():
+    sessions = [pool.session(language)] if language else pool.ordered()
+    for session in sessions:
         for file in files_mentioning(session, address.path[-1]):
             if (id(session), file) in checked:
                 continue
             declarations = file_declarations(session, file)
             for declaration in match_declarations(declarations, address.path, address.overload):
                 found.append((session, file, declaration, declarations))
+    if found:
+        return found
+    # Last: the workspace index itself. An outline can be the stale one —
+    # sourcekit-lsp kept answering with the old name for seconds after a
+    # rename it had been told about, while its project-wide search had caught
+    # up. Neither view is reliably fresher than the other, so both are asked.
+    for session in sessions:
+        for hit in workspace_hits(session, address.path[-1]):
+            qualifiers, leaf, impl_block = split_symbol_name(hit.get("name", ""))
+            chain = [*qualifiers, leaf]
+            file = to_relative(hit.get("location") or {})
+            if impl_block or leaf != address.path[-1] or not file:
+                continue
+            if chain[-len(address.path):] != list(address.path) or not (session.root / file).is_file():
+                continue
+            location = hit.get("location") or {}
+            symbol = {
+                "name": leaf, "kind": hit.get("kind"),
+                "range": location.get("range") or {},
+                "selectionRange": location.get("selectionRange") or location.get("range") or {},
+            }
+            if symbol["range"]:
+                found.append((session, file, Declaration(symbol, chain), []))
     return found
 
 
