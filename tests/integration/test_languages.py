@@ -421,8 +421,14 @@ class LanguageContract:
             {"symbol": "NullStore", "new_name": "VoidStore", "apply": True},
         )
         self.assertFalse(is_error, text)
+        # On disk as well as in the answer: "never became visible" has two very
+        # different causes, a rename that wrote nothing and a server that did
+        # not see what was written.
+        on_disk = [name for name, raw in self.snapshot(_repo).items() if b"VoidStore" in raw]
+        on_disk += [p.name for p in _repo.rglob("*VoidStore*") if p.is_file()]
         self.assertTrue(self.resolves(server, "VoidStore"),
-                        f"the renamed symbol never became visible; last answer: {self.last_answer}")
+                        f"the renamed symbol never became visible; last answer: "
+                        f"{self.last_answer} — files on disk with the new name: {on_disk}")
 
 
 def _make_case(spec: languages.LanguageSpec) -> type[unittest.TestCase]:
