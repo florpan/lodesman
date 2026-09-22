@@ -87,6 +87,13 @@ class TestParse(unittest.TestCase):
         with self.assertRaises(ToolError):
             parse_address("  ")
 
+    def test_an_absolute_path_keeps_its_root(self):
+        # Stripped of its leading slash, "/etc/passwd" would read as a path
+        # inside the repository, and containment is decided on that string.
+        self.assertEqual(parse_address("/etc/passwd:Name").where, "/etc/passwd")
+        self.assertEqual(parse_address("C:/repo/a.cs:Name").where, "C:/repo/a.cs")
+        self.assertEqual(parse_address("src/store/:Name").where, "src/store")
+
 
 class TestMatch(unittest.TestCase):
     def names(self, hits):

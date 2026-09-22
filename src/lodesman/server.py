@@ -1707,7 +1707,9 @@ def parse_address(text: str) -> Address:
         if i < skip:
             continue
         if char == ":" and text[i + 1:i + 2] != ":" and (i == 0 or text[i - 1] != ":"):
-            where, rest = text[:i].strip().replace("\\", "/").strip("/") or None, text[i + 1:].strip()
+            # rstrip only: a leading slash means an absolute path, and dropping
+            # it would turn "/etc/passwd" into a path inside the repository.
+            where, rest = text[:i].strip().replace("\\", "/").rstrip("/") or None, text[i + 1:].strip()
             break
     position = re.fullmatch(r"(\d+)(?::(\d+))?", rest)
     if position:
@@ -2901,7 +2903,10 @@ def find_symbol_in(pool: LanguageServerPool, args: dict) -> str:
         raise ToolError(f"language {language!r} is not served here; this repository has "
                         f"{', '.join(pool.languages)}")
     if where:
-        where = where.replace("\\", "/").strip("/")
+        # Only the trailing slash: a leading one means an absolute path, which
+        # source_files_under refuses when it is outside the repository. Stripped,
+        # "/etc/passwd" would read as a path inside it.
+        where = where.replace("\\", "/").rstrip("/")
     if not name and not where:
         raise ToolError("give name, file, or both")
 
