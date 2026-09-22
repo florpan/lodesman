@@ -1992,9 +1992,31 @@ def resolve(pool: LanguageServerPool, text: str) -> Target:
         raise ToolError(f"{text!r} matches {len(matches)} declarations; use one of these "
                         f"addresses:\n" + "\n".join(rows) + more)
     session, file, declaration, declarations = matches[0]
-    line, column = position_of(declaration.symbol)
+    line, column = name_position(session, file, declaration)
     return Target(session, file, line, column, declaration,
                   f"{file}:{address_in_file(declaration, declarations)}")
+
+
+def name_position(session: LanguageServerSession, file: str, declaration: Declaration) -> tuple[int, int]:
+    """
+    Where the declaration's own name is, which is where LSP requests must point.
+
+    A server's selectionRange is supposed to cover the name, and most do, but
+    ruby-lsp points at the `class` keyword — and textDocument/implementation
+    there answers nothing, which cost the Ruby type hierarchy its subtypes.
+    So the name is looked for on that line, and the server's position kept
+    only if nothing better is found.
+    """
+    line, column = position_of(declaration.symbol)
+    leaf = declaration.chain[-1]
+    try:
+        text = file_lines(session, file)[line]
+    except (OSError, IndexError, UnicodeDecodeError):
+        return line, column
+    if text[utf16_index(text, column):].startswith(leaf):
+        return line, column
+    found = re.search(rf"(?<![\w$]){re.escape(leaf)}(?![\w$])", text)
+    return (line, utf16_units(text[:found.start()])) if found else (line, column)
 
 
 def file_diagnostics(session: LanguageServerSession, target: str, min_severity: int) -> list[dict]:
@@ -2945,26 +2967,35 @@ def find_symbol_in(pool: LanguageServerPool, args: dict) -> str:
     exact = [(file, d, decls) for session, file, d, decls in resolve_all(pool, address, language)
              if not kind or kind_of(d.symbol) == kind]
 
-    # Names that merely contain it: counted from the workspace index, listed
-    # from the outlines of their files only when asked for or nothing is exact.
-    partial_hits = [
+    # Names that merely contain it. The workspace index is not enough: jdtls
+    # and ruby-lsp do not match substrings, so "Store" found neither
+    # MemoryStore nor NullStore through them. The files that mention the name
+    # are outlined as well — a class named MemoryStore is declared in a file
+    # that says Store.
+    from_index = [
         (session, to_relative(h.get("location") or {}))
         for session in sessions for h in workspace_hits(session, leaf)
         if split_symbol_name(h.get("name", ""))[1] != leaf
         and leaf.lower() in split_symbol_name(h.get("name", ""))[1].lower()
-        and (not kind or kind_of(h) == kind)
     ]
-    partial_hits = [(s, f) for s, f in partial_hits if f and under(f, where, pool.root)]
+
+    def containing() -> list:
+        """Declarations whose name contains the query. Read only when needed."""
+        files = [*from_index, *((s, f) for s in sessions for f in files_mentioning(s, leaf))]
+        found = []
+        for session, file in sorted({(id(s), f): (s, f) for s, f in files
+                                     if f and under(f, where, pool.root)}.values(),
+                                    key=lambda pair: pair[1]):
+            declarations = file_declarations(session, file)
+            found += [(file, d, declarations) for d in declarations
+                      if d.chain[-1] != leaf and leaf.lower() in d.chain[-1].lower()
+                      and (not kind or kind_of(d.symbol) == kind)]
+        return found
+
     listed, label = exact, "named"
     if args.get("partial") or not exact:
         label = "named or containing"
-        listed = list(exact)
-        for session, file in sorted({(id(s), f): (s, f) for s, f in partial_hits}.values(),
-                                    key=lambda pair: pair[1]):
-            decls = file_declarations(session, file)
-            listed += [(file, d, decls) for d in decls
-                       if d.chain[-1] != leaf and leaf.lower() in d.chain[-1].lower()
-                       and (not kind or kind_of(d.symbol) == kind)]
+        listed = [*exact, *containing()]
 
     if not listed:
         caveats = "".join(sibling_project_caveat(s) for s in sessions)
@@ -2977,9 +3008,11 @@ def find_symbol_in(pool: LanguageServerPool, args: dict) -> str:
     if len(listed) > limit:
         out.append(f"  … truncated at {limit} of {len(listed)}. Too broad to act on as a set: "
                    "narrow it with file, language, kind or a qualified name.")
-    others = len(partial_hits) if listed is exact else 0
+    # Counted from the index alone, which is cheap; listing them reads outlines.
+    others = len({(id(s), f) for s, f in from_index}) if listed is exact else 0
     if others:
-        out.append(f"  ({others} other name(s) contain {leaf!r}; partial=true lists them)")
+        out.append(f"  (partial=true also lists names containing {leaf!r}; the index knows "
+                   f"of {others} such file(s))")
     return "\n".join(out)
 
 

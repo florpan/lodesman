@@ -332,10 +332,11 @@ Testing help is very welcome.
   and sometimes briefly loses a symbol. Lookups by name fall back to the
   outlines of the files that mention the name when the search comes back
   empty or stale, so they keep working.
-- **PHP without a licence:** intelephense reserves references, rename,
-  implementations, type definition, type hierarchy and code actions for
-  licensed users. Without `INTELEPHENSE_LICENSE_KEY` these are refused or
-  reported as inconclusive, never answered as empty.
+- **PHP without a licence:** intelephense reserves rename, implementations,
+  type definition, type hierarchy and code actions for licensed users.
+  Without `INTELEPHENSE_LICENSE_KEY` these are refused or reported as
+  inconclusive, never answered as empty. References do work: what failed
+  before 0.6.0 was the position the request was made at, not the feature.
 
 Fixed in 0.3.1:
 

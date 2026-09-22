@@ -711,14 +711,12 @@ PHP = LanguageSpec(
     language="php",
     outline_file="src/Store.php",
     requires=("node", "npm"),
-    # Measured, not assumed: on an unlicensed intelephense, find_references
-    # returns nothing for a class that is demonstrably used in a sibling file,
-    # and rename produces no edits — while document_symbols on that same
-    # sibling file works, so the file is parsed. Waiting 19s changes nothing
-    # and opening the referencing file first changes nothing. solidlsp's own
-    # intelephense wrapper reads INTELEPHENSE_LICENSE_KEY, which is consistent
-    # with these being the licensed features.
-    supports_references=False,
+    # References do work without a licence, once the request points at the
+    # right place: asking at the name in the file's own outline found 8
+    # references to Record across 2 files (CI, 2026-09-22). It was the
+    # workspace index's position that answered nothing, which earlier readings
+    # took for a licensed feature. Rename still produces no edits.
+    supports_references=True,
     supports_rename=False,
     known_failures={
         "test_type_definition_resolves_a_local":
@@ -734,7 +732,7 @@ PHP = LanguageSpec(
     },
     notes=(
         "intelephense analyses PHP from node; a PHP runtime is not required. "
-        "References and rename need a licence — set INTELEPHENSE_LICENSE_KEY "
+        "Rename needs a licence — set INTELEPHENSE_LICENSE_KEY "
         "for full coverage."
     ),
     files={
