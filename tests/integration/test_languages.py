@@ -377,6 +377,9 @@ class LanguageContract:
         catches up, not that it does so before the next request arrives. A
         server that was never told stays wrong for the whole window.
         """
+        # Set before the first poll: assertTrue builds its message whether or
+        # not it fails, so an unset attribute is an error in every language.
+        self.last_answer = "(not asked yet)"
         deadline = time.time() + timeout
         while True:
             text, is_error = server.call("find_symbol", {"name": name})
