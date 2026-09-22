@@ -401,8 +401,7 @@ class LanguageContract:
                 path.write_bytes(raw.replace(b"NullStore", b"VoidStore"))
 
         self.assertTrue(self.resolves(server, "VoidStore"),
-                        f"a type added on disk never became visible; last answer:
-{self.last_answer}")
+                        f"a type added on disk never became visible; last answer: {self.last_answer}")
 
     def test_sees_its_own_rename(self):
         # rename_symbol writes the files itself. A second question straight
@@ -420,8 +419,7 @@ class LanguageContract:
         )
         self.assertFalse(is_error, text)
         self.assertTrue(self.resolves(server, "VoidStore"),
-                        f"the renamed symbol never became visible; last answer:
-{self.last_answer}")
+                        f"the renamed symbol never became visible; last answer: {self.last_answer}")
 
 
 def _make_case(spec: languages.LanguageSpec) -> type[unittest.TestCase]:
