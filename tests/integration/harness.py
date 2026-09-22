@@ -155,7 +155,8 @@ class Server:
                     )
                 except (ServerError, TimeoutError):
                     return False
-                if is_error or symbol not in text:
+                # "No declaration named 'Store'" names it too: not an answer.
+                if is_error or symbol not in text or "No declaration named" in text:
                     missing.append(symbol)
             if not missing:
                 return any(READY_MARKER in line for line in self.stderr)

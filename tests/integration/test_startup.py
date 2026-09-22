@@ -21,11 +21,11 @@ from tests.integration import fixtures
 from tests.integration.harness import SRC, Server
 
 EXPECTED_TOOLS = {
-    "project_info", "find_symbol", "get_symbols_overview", "find_references",
-    "get_symbol_body", "get_file_diagnostics", "find_definition", "explain_symbol",
+    "project_info", "find_symbol", "find_references",
+    "get_symbol_body", "get_file_diagnostics",
     "blast_radius", "rename_symbol", "find_implementations",
     "type_definition", "call_hierarchy", "type_hierarchy", "code_action",
-    "replace_symbol_body", "insert_before_symbol", "insert_after_symbol", "safe_delete_symbol",
+    "replace_symbol_body", "insert_at_symbol", "safe_delete_symbol",
 }
 
 
@@ -151,7 +151,7 @@ class TestMultipleLanguages(unittest.TestCase):
     def test_a_file_of_an_unserved_language_is_refused_clearly(self):
         server = self.start()
         (self.repo / "notes.md").write_text("# notes\n", encoding="utf-8")
-        text, is_error = server.call("get_symbols_overview", {"file": "notes.md"})
+        text, is_error = server.call("find_symbol", {"file": "notes.md"})
         self.assertTrue(is_error, text)
         self.assertIn("not a file this server handles", text)
         # The refusal has to say what it does serve, or it is a dead end.
@@ -177,7 +177,7 @@ class TestPathContainment(IntegrationCase):
         outside = "C:/Windows/win.ini" if sys.platform == "win32" else "/etc/passwd"
         with Server(self.repos["py_lf"], language="python") as server:
             self.assertRejected(server, "get_file_diagnostics", outside)
-            self.assertRejected(server, "get_symbols_overview", outside)
+            self.assertRejected(server, "find_symbol", outside)
 
     def test_dotdot_escape_is_refused(self):
         with Server(self.repos["py_lf"], language="python") as server:

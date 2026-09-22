@@ -74,7 +74,7 @@ class TestRenameWritesToDisk(RenameCase):
         before = self.snapshot()
         text, is_error = self.server.call(
             "rename_symbol",
-            {"name": "NullStore", "new_name": "VoidStore", "apply": True},
+            {"symbol": "NullStore", "new_name": "VoidStore", "apply": True},
         )
         self.assertFalse(is_error, text)
         self.assertIn("Written:", text)
@@ -90,7 +90,7 @@ class TestRenameWritesToDisk(RenameCase):
     def test_dry_run_writes_nothing(self):
         before = self.snapshot()
         text, is_error = self.server.call(
-            "rename_symbol", {"name": "NullStore", "new_name": "VoidStore"}
+            "rename_symbol", {"symbol": "NullStore", "new_name": "VoidStore"}
         )
         self.assertFalse(is_error, text)
         self.assertIn("Dry run", text)
@@ -106,7 +106,7 @@ class TestRenamePreservesCrlf(RenameCase):
                         "fixture should have been written with CRLF")
 
         self.server.call("rename_symbol",
-                         {"name": "NullStore", "new_name": "VoidStore", "apply": True})
+                         {"symbol": "NullStore", "new_name": "VoidStore", "apply": True})
 
         for path, raw in self.snapshot().items():
             with self.subTest(file=path.name):
@@ -124,7 +124,7 @@ class TestRenameHandlesNonBmp(RenameCase):
         # line, so an implementation indexing a Python str with an LSP column
         # drifts by four UTF-16 code units.
         self.server.call("rename_symbol",
-                         {"name": "NullStore", "new_name": "VoidStore", "apply": True})
+                         {"symbol": "NullStore", "new_name": "VoidStore", "apply": True})
 
         init = (self.repo / "src" / "store" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('"\U0001f389\U0001f680"', init, "the emoji were corrupted")
@@ -142,7 +142,7 @@ class TestRenameTypeScript(RenameCase):
         before = self.snapshot()
         text, is_error = self.server.call(
             "rename_symbol",
-            {"name": "NullStore", "new_name": "VoidStore", "apply": True},
+            {"symbol": "NullStore", "new_name": "VoidStore", "apply": True},
         )
         self.assertFalse(is_error, text)
         self.assertNotEqual(self.snapshot(), before)
@@ -150,10 +150,11 @@ class TestRenameTypeScript(RenameCase):
         # TypeScript does serve textDocument/implementation, unlike pyright.
         # The tool answers with locations, not names: MemoryStore and the
         # freshly renamed VoidStore, both in store.ts.
-        found, is_error = self.server.call("find_implementations", {"name": "Store"})
+        found, is_error = self.server.call("find_implementations", {"symbol": "Store"})
         self.assertFalse(is_error, found)
         self.assertIn("2 implementation(s)", found)
-        self.assertEqual(found.count("src/store.ts:"), 3)  # 1 resolution + 2 hits
+        self.assertIn("src/store.ts:MemoryStore", found)
+        self.assertIn("src/store.ts:VoidStore", found)
 
 
 class TestSetUpFailureCleansUp(unittest.TestCase):

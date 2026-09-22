@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lodesman-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "Compiler-grade code intelligence over MCP — a language server's own answers, as agent tools"
 readme = "README.md"
 requires-python = ">=3.11"

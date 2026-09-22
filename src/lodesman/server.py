@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from solidlsp import SolidLanguageServer
@@ -41,7 +43,7 @@ from solidlsp.settings import SolidLSPSettings
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "lodesman"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 # Probe for the index-readiness gate: short, and matches something in any repo.
 WARM_PROBE = "a"
@@ -461,7 +463,7 @@ class LanguageServerSession:
         and answer workspace-wide queries out of whatever projects are loaded.
         tsserver is one: with no file open it has no project, and
         `workspace/symbol` fails with "No Project" — which takes out
-        `find_symbol`, `find_definition`, and `find_references` without a
+        `find_symbol` and `find_references` without a
         file/line hint. Opening a file per request and closing it again is not
         enough; the project goes away with it.
 
@@ -809,347 +811,222 @@ def position_of(symbol: dict) -> tuple[int, int] | None:
     return None
 
 
+SYMBOL = {
+    "type": "string",
+    "description": "Address, e.g. Type.member or path/File.cs:Name",
+}
+
 TOOLS = [
     {
         "name": "project_info",
         "description": (
-            "Which repository this server bound to, and how. Answers cheaply without "
-            "starting the language server — use it first to confirm the server is "
-            "pointed at the project you think it is."
+            "Orientation, without starting a language server: the repository's "
+            "languages, project files, and where its source files are."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "find_symbol",
         "description": (
-            "Find a symbol by name anywhere in the project, resolved by the language "
-            "server rather than by text search. Returns each match with its file and line."
+            "Find declarations, each with its address. By name: exact names in every "
+            "language (partial=true adds names containing it). By file only (a file, "
+            "folder or glob): the outline of those files."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Symbol name or fragment"},
-                "limit": {"type": "integer", "description": "Max results (default 25)"},
+                "name": {"type": "string", "description": "Name, or Type.member"},
+                "file": {"type": "string", "description": "File, folder or glob to search in"},
+                "language": {"type": "string"},
+                "kind": {"type": "string", "description": "e.g. class, method, property, function"},
+                "partial": {"type": "boolean"},
+                "depth": {"type": "integer", "description": "Outline: 1 = top level only"},
+                "limit": {"type": "integer", "description": "Default 25 by name, 200 outline"},
             },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "get_symbols_overview",
-        "description": (
-            "Outline one file: every type, method, and field it declares, with line "
-            "numbers. The API surface of the file without reading its body."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "file": {"type": "string", "description": "Path relative to the repo root"},
-            },
-            "required": ["file"],
         },
     },
     {
         "name": "find_references",
         "description": (
-            "Find everything that references a symbol — the real call/usage sites the "
-            "compiler sees, including dependency-injection registrations and interface "
-            "implementations that a text search misses. Run this before renaming, "
-            "changing a signature, or deleting."
+            "Every usage of a symbol as the compiler sees it, with its line of code and "
+            "the declaration it is in. Use before renaming, changing a signature or deleting."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Symbol name to look up"},
-                "file": {"type": "string", "description": "Optional: file containing the symbol"},
-                "line": {"type": "integer", "description": "Optional: 1-based line of the symbol"},
-                "limit": {"type": "integer", "description": "Max results (default 50)"},
-                "include_code": {
-                    "type": "boolean",
-                    "description": (
-                        "Show the source at each reference (default true). Leave it on: "
-                        "without it you must open each file to use the answer."
-                    ),
-                },
+                "symbol": SYMBOL,
+                "context": {"type": "integer", "description": "Lines around each; default 0 (3 for one)"},
+                "include_code": {"type": "boolean", "description": "Default true"},
+                "limit": {"type": "integer", "description": "Default 50"},
             },
-            "required": ["name"],
+            "required": ["symbol"],
         },
     },
     {
         "name": "get_symbol_body",
         "description": (
-            "The full source of one declaration, by name — a method, class or function — "
-            "without reading the file it lives in. Use this instead of opening a file to "
-            "look at a single member. The text is exactly what replace_symbol_body "
-            "replaces, so it can be edited and passed back."
+            "Source of one declaration, without reading its file. Exactly the text "
+            "replace_symbol_body replaces."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
-                "file": {"type": "string", "description": "Optional: file containing it"},
-                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
-            },
-            "required": ["name"],
+            "properties": {"symbol": SYMBOL},
+            "required": ["symbol"],
         },
     },
     {
         "name": "get_file_diagnostics",
-        "description": (
-            "Compiler diagnostics for one file, from the already-running language server — "
-            "errors and warnings in milliseconds, without a build. Run this after editing "
-            "to confirm the change compiles."
-        ),
+        "description": "Compiler errors and warnings for one file, without a build.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file": {"type": "string", "description": "Path relative to the repo root"},
-                "limit": {"type": "integer", "description": "Max diagnostics (default 40)"},
+                "file": {"type": "string", "description": "Repo-relative path"},
+                "limit": {"type": "integer", "description": "Default 40"},
                 "severity": {
                     "type": "integer",
-                    "description": (
-                        "Lowest severity to report: 1 errors only, 2 errors+warnings "
-                        "(default), 3 adds info, 4 adds style hints."
-                    ),
+                    "description": "Lowest to report: 1 error, 2 warning (default), 3 info, 4 hint",
                 },
             },
             "required": ["file"],
         },
     },
     {
-        "name": "find_definition",
-        "description": "Jump to where a symbol is defined, resolved by the language server.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Symbol name to look up"},
-            },
-            "required": ["name"],
-        },
-    },
-    {
-        "name": "explain_symbol",
-        "description": (
-            "What a symbol is: resolved type, signature and documentation, plus its "
-            "declaration line. Answers 'what does this call do' without opening the file."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"name": {"type": "string", "description": "Symbol name"}},
-            "required": ["name"],
-        },
-    },
-    {
         "name": "blast_radius",
-        "description": (
-            "What breaks if this symbol changes: everything that references it, then "
-            "everything that references those, to the given depth. Run before changing a "
-            "signature or deleting anything."
-        ),
+        "description": "What references a symbol, and what references those, to a depth.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Symbol name"},
-                "depth": {"type": "integer", "description": "Hops to follow, 1-4 (default 2)"},
-                "max_queries": {"type": "integer", "description": "Query budget (default 60)"},
+                "symbol": SYMBOL,
+                "depth": {"type": "integer", "description": "1-4, default 2"},
+                "max_queries": {"type": "integer", "description": "Default 60"},
             },
-            "required": ["name"],
+            "required": ["symbol"],
         },
     },
     {
         "name": "rename_symbol",
         "description": (
-            "Rename a symbol everywhere, using the compiler's own understanding rather "
-            "than text replacement — so it renames the right things and leaves unrelated "
-            "same-named symbols alone. Defaults to a dry run showing what would change."
+            "Rename symbols and every reference to them via the compiler. Give one "
+            "address or a list (e.g. the backend and frontend declarations). Previews "
+            "unless apply=true."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Current symbol name"},
-                "new_name": {"type": "string", "description": "New name"},
-                "apply": {
-                    "type": "boolean",
-                    "description": "Write the changes. Omit or false to preview only.",
+                "symbol": {
+                    "anyOf": [SYMBOL, {"type": "array", "items": {"type": "string"}}],
                 },
+                "new_name": {"type": "string"},
+                "apply": {"type": "boolean"},
             },
-            "required": ["name", "new_name"],
+            "required": ["symbol", "new_name"],
         },
     },
     {
         "name": "find_implementations",
-        "description": (
-            "Find the concrete implementations of an interface or abstract member, or "
-            "the overrides of a virtual one. Answers 'what actually runs when this is "
-            "called', which references alone cannot tell you."
-        ),
+        "description": "Implementations of an interface or abstract member, or overrides of a virtual one.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Interface or member name"},
-                "limit": {"type": "integer", "description": "Max results (default 50)"},
+                "symbol": SYMBOL,
+                "limit": {"type": "integer", "description": "Default 50"},
             },
-            "required": ["name"],
+            "required": ["symbol"],
         },
     },
     {
         "name": "type_definition",
         "description": (
-            "The declaration of a symbol's type: what a variable, field, parameter or "
-            "property actually is, shown as code. Name a field or property directly, or "
-            "point at a local variable with file, line and symbol."
+            "Code of the type of a field or property, or of a local or parameter "
+            "addressed as file:line:col."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Field, property or member name"},
-                "file": {"type": "string", "description": "For a local: file it appears in"},
-                "line": {"type": "integer", "description": "For a local: 1-based line it appears on"},
-                "symbol": {"type": "string", "description": "For a local: the identifier on that line"},
-            },
+            "properties": {"symbol": SYMBOL},
+            "required": ["symbol"],
         },
     },
     {
         "name": "call_hierarchy",
-        "description": (
-            "Who calls this function (incoming), or what it calls (outgoing), with the "
-            "line of each call. Follows the chain to the given depth, so it answers "
-            "'how does execution reach this' in one call."
-        ),
+        "description": "Callers (incoming) or callees (outgoing) of a function, to a depth.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Function or method name"},
-                "direction": {
-                    "type": "string",
-                    "enum": ["incoming", "outgoing"],
-                    "description": "incoming (default): callers. outgoing: callees.",
-                },
-                "depth": {"type": "integer", "description": "Levels to follow, 1-4 (default 1)"},
+                "symbol": SYMBOL,
+                "direction": {"type": "string", "enum": ["incoming", "outgoing"]},
+                "depth": {"type": "integer", "description": "1-4, default 1"},
             },
-            "required": ["name"],
+            "required": ["symbol"],
         },
     },
     {
         "name": "type_hierarchy",
-        "description": (
-            "What a type inherits from and implements (supertypes), and what derives "
-            "from or implements it (subtypes), each with its declaration line."
-        ),
+        "description": "Supertypes and subtypes of a type.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Type name"},
-                "direction": {
-                    "type": "string",
-                    "enum": ["both", "supertypes", "subtypes"],
-                    "description": "Default both.",
-                },
+                "symbol": SYMBOL,
+                "direction": {"type": "string", "enum": ["both", "supertypes", "subtypes"]},
             },
-            "required": ["name"],
+            "required": ["symbol"],
         },
     },
     {
         "name": "replace_symbol_body",
         "description": (
-            "Replace a whole declaration — signature and body — by name, without "
-            "reading the file. Returns the diff and the file's errors afterwards. "
-            "Qualify an ambiguous name as Type.member, or pass file/line. The body's "
-            "first line goes where the declaration starts; later lines are used as "
-            "given, so the output of get_symbol_body can be edited and passed back."
+            "Replace a whole declaration, signature included. Returns the diff and "
+            "the file's errors after. For a small change inside it, a text edit is cheaper."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
+                "symbol": SYMBOL,
                 "body": {"type": "string", "description": "The complete new declaration"},
-                "file": {"type": "string", "description": "Optional: file containing it"},
-                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
             },
-            "required": ["name", "body"],
+            "required": ["symbol", "body"],
         },
     },
     {
-        "name": "insert_before_symbol",
+        "name": "insert_at_symbol",
         "description": (
-            "Insert code on its own lines directly before a declaration (above its "
-            "doc comment or attributes). Content is used verbatim, indentation "
-            "included. Returns the diff and the file's errors afterwards."
+            "Insert code on its own lines before a declaration (above its doc comment) "
+            "or after it. Content is verbatim. Returns the diff and the file's errors after."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
-                "content": {"type": "string", "description": "Code to insert"},
-                "file": {"type": "string", "description": "Optional: file containing it"},
-                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
+                "symbol": SYMBOL,
+                "position": {"type": "string", "enum": ["before", "after"]},
+                "content": {"type": "string"},
             },
-            "required": ["name", "content"],
-        },
-    },
-    {
-        "name": "insert_after_symbol",
-        "description": (
-            "Insert code on its own lines directly after a declaration — e.g. a new "
-            "method after an existing one. Content is used verbatim, indentation "
-            "included; start it with an empty line for a blank separator. Returns "
-            "the diff and the file's errors afterwards."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
-                "content": {"type": "string", "description": "Code to insert"},
-                "file": {"type": "string", "description": "Optional: file containing it"},
-                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
-            },
-            "required": ["name", "content"],
+            "required": ["symbol", "position", "content"],
         },
     },
     {
         "name": "safe_delete_symbol",
-        "description": (
-            "Delete a declaration, with its doc comment and attributes — only if "
-            "nothing uses it. Refuses, listing the usages, if the language server "
-            "reports any references or a text search finds the name elsewhere."
-        ),
+        "description": "Delete a declaration with its doc comment, only if nothing uses it.",
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Symbol name, optionally qualified: Type.member"},
-                "file": {"type": "string", "description": "Optional: file containing it"},
-                "line": {"type": "integer", "description": "Optional: a 1-based line inside it"},
-            },
-            "required": ["name"],
+            "properties": {"symbol": SYMBOL},
+            "required": ["symbol"],
         },
     },
     {
         "name": "code_action",
         "description": (
-            "The language server's quick fixes and refactorings for a line: add a "
-            "missing import or using, implement an interface, extract a method and "
-            "so on. Without a title, lists what is available. With a title, previews "
-            "the change as a diff; add apply=true to write it."
+            "The language server's quick fixes and refactorings for a line (add import, "
+            "implement interface, extract method...). No title: list them. With title: "
+            "preview the diff; apply=true writes it."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file": {"type": "string", "description": "Path relative to the repo root"},
-                "line": {"type": "integer", "description": "1-based line"},
-                "end_line": {"type": "integer", "description": "Optional last line of a range"},
-                "title": {
-                    "type": "string",
-                    "description": "The action to take, as listed. A unique fragment is enough.",
-                },
-                "kind": {
-                    "type": "string",
-                    "description": "Only actions of this kind, e.g. quickfix, refactor, source",
-                },
-                "apply": {
-                    "type": "boolean",
-                    "description": "Write the change. Omit or false to preview only.",
-                },
+                "at": {"type": "string", "description": "file:line or file:line-line"},
+                "title": {"type": "string", "description": "As listed; a unique fragment is enough"},
+                "kind": {"type": "string", "description": "e.g. quickfix, refactor, source"},
+                "apply": {"type": "boolean"},
             },
-            "required": ["file", "line"],
+            "required": ["at"],
         },
     },
 ]
@@ -1157,13 +1034,6 @@ TOOLS = [
 
 class ToolError(Exception):
     pass
-
-
-class NotFoundHere(ToolError):
-    """
-    This language's server has no such symbol — which says nothing about the
-    others. Raised rather than returned so dispatch asks the next language.
-    """
 
 
 def repo_file(target: str) -> str:
@@ -1312,44 +1182,21 @@ def peek(session: LanguageServerSession, file: str, line: int,
     return "\n".join(rows)
 
 
-# LSP SymbolKind values. A C# name is routinely both a type and its constructor,
-# and asking about "RagQueryService" almost always means the type.
+# LSP SymbolKind values.
 KIND_NAMES = {
     1: "file", 4: "package",
     2: "module", 3: "namespace", 5: "class", 6: "method", 7: "property",
     8: "field", 9: "constructor", 10: "enum", 11: "interface", 12: "function",
     13: "variable", 14: "constant", 22: "enum member", 23: "struct", 24: "event",
 }
-TYPE_LIKE_KINDS = {2, 3, 5, 10, 11, 23}
+CALLABLE_KINDS = {6, 9, 12}
+# Containers an outline's depth counts from inside of: a C# file-scoped
+# namespace is the top level of every file, so "depth 1" meant only it (c6).
+NAMESPACE_KINDS = {2, 3, 4}
 
 
 def kind_of(hit: dict) -> str:
     return KIND_NAMES.get(hit.get("kind"), f"kind={hit.get('kind')}")
-
-
-def describe(hit: dict) -> str:
-    return f"{hit.get('name')} ({kind_of(hit)}) — {location_of(hit)}"
-
-
-def rank_candidates(hits: list[dict], name: str) -> list[dict]:
-    """
-    Order workspace-symbol hits by how likely they are to be what was asked for:
-    exact name first, then types over members, then location.
-
-    Roslyn's ordering is not stable between processes, so taking the first exact
-    match made results depend on which one it happened to list first — for a C#
-    service that is a coin flip between the class and its constructor, and the
-    constructor has no references of its own. Ranking, with location as the
-    tie-break, means the same question gets the same answer twice.
-    """
-    return sorted(
-        hits,
-        key=lambda h: (
-            0 if h.get("name") == name else 1,
-            0 if h.get("kind") in TYPE_LIKE_KINDS else 1,
-            location_of(h),
-        ),
-    )
 
 
 def workspace_hits(session: LanguageServerSession, query: str) -> list[dict]:
@@ -1485,52 +1332,6 @@ def restore_state(root: Path, target: str) -> tuple[str | None, str | None]:
         if directory == root or root not in directory.parents:
             return None, None
         directory = directory.parent
-
-
-def candidates_for(session: LanguageServerSession, name: str) -> list[dict]:
-    """
-    Ranked declarations to try for `name` — exact matches only if any exist.
-
-    Falls back to file outlines when the workspace index has nothing. CI saw
-    sourcekit-lsp lose NullStore from its workspace search moments after
-    finding it, three runs in a row, each time failing a different tool —
-    rename, safe_delete, a disk-edit check — because every tool that takes a
-    name starts here. The outlines come from the files, not from the index.
-    """
-    hits = workspace_hits(session, name)
-    if not hits:
-        try:
-            matches = declaration_matches(session, name, None, None)
-        except ToolError:
-            matches = []
-        hits = [{
-            "name": split_symbol_name(symbol.get("name", ""))[1],
-            "kind": symbol.get("kind"),
-            "selectionRange": symbol.get("selectionRange") or symbol["range"],
-            "location": {"uri": session.server._resolve_file_uri(path), "range": symbol["range"]},
-        } for path, symbol, _qualified in matches]
-    if not hits:
-        raise ToolError(f"no symbol named {name!r} found in the project")
-    exact = [h for h in hits if h.get("name") == name]
-    return rank_candidates(exact or hits, name)
-
-
-def resolve_symbol(session: LanguageServerSession, name: str) -> dict:
-    """The most likely workspace match for `name`."""
-    return candidates_for(session, name)[0]
-
-
-def declarations(session: LanguageServerSession, name: str) -> list[tuple[str, int, int, str]]:
-    """Every usable declaration of `name` as (file, line, column, label), most likely first."""
-    found = []
-    for candidate in candidates_for(session, name):
-        path = to_relative(candidate.get("location") or {})
-        position = position_of(candidate)
-        if path and position:
-            found.append((path, position[0], position[1], describe(candidate)))
-    if not found:
-        raise ToolError(f"symbol {name!r} has no usable location")
-    return found
 
 
 class Unsupported(Exception):
@@ -1871,6 +1672,329 @@ def deletion_span(lines: list[str], symbol_range: dict, first: int) -> dict:
     return {"start": {"line": first, "character": 0}, "end": {"line": stop, "character": 0}}
 
 
+# -- Symbol addresses ----------------------------------------------------------
+#
+# Every tool that acts on code takes one `symbol` string, the address, and every
+# tool prints symbols as addresses the next call can copy. The design, and why a
+# bare name was not enough, is in workdocs/ADDRESSING.md.
+#
+#     [<where>:]<name path>[#n | (types)]      a declaration
+#     <file>:<line>[:<column>]                 a position
+#
+# An address is resolved afresh on every call, from the files as they are, and
+# must mean exactly one thing: there is no "most likely" pick, because that is
+# how a TypeScript BookDto came back for the C# one.
+
+@dataclass(frozen=True)
+class Address:
+    text: str
+    where: str | None
+    path: tuple[str, ...]  # the name path; empty for a position
+    overload: str | None   # "#2" or "(int,string)"
+    line: int | None       # 1-based
+    column: int | None     # 1-based, in characters
+
+
+def parse_address(text: str) -> Address:
+    text = (text or "").strip()
+    if not text:
+        raise ToolError("symbol is required: a name, Type.member, or file:Name, file:line")
+    # The first colon that is not part of "::" (C++, Rust, Ruby name paths), and
+    # not a Windows drive's: "C:/repo/a.cs:Name" is a file and a name.
+    where, rest = None, text
+    skip = 2 if re.match(r"[A-Za-z]:[/\\]", text) else 0
+    for i, char in enumerate(text):
+        if i < skip:
+            continue
+        if char == ":" and text[i + 1:i + 2] != ":" and (i == 0 or text[i - 1] != ":"):
+            where, rest = text[:i].strip().replace("\\", "/").strip("/") or None, text[i + 1:].strip()
+            break
+    position = re.fullmatch(r"(\d+)(?::(\d+))?", rest)
+    if position:
+        if not where:
+            raise ToolError(f"{text!r}: a line needs a file, as in path/to/file.cs:42")
+        return Address(text, where, (), None, int(position.group(1)),
+                       int(position.group(2)) if position.group(2) else None)
+    overload = None
+    number = re.search(r"#(\d+)$", rest)
+    if number:
+        overload, rest = number.group(0), rest[:number.start()]
+    elif rest.endswith(")") and "(" in rest:
+        start = rest.index("(")
+        overload, rest = re.sub(r"\s+", "", rest[start:]), rest[:start]
+    path = tuple(name_path(rest))
+    if not path:
+        raise ToolError(f"{text!r} names no symbol")
+    return Address(text, where, path, overload, None, None)
+
+
+@dataclass(eq=False)
+class Declaration:
+    """One declaration in one file's outline, with the names enclosing it."""
+    symbol: dict
+    chain: list[str]  # enclosing names, outermost first, ending with its own
+
+
+def file_declarations(session: LanguageServerSession, file: str) -> list[Declaration]:
+    """Every declaration in `file`, from the language server's outline of it."""
+    source = file_lines(session, file) if session.language == "go" else []
+    found = []
+    for symbol in symbols_of(session.server.request_document_symbols(file)):
+        own, leaf, impl_block = split_symbol_name(symbol.get("name", ""))
+        if impl_block or not leaf or not symbol.get("range"):
+            continue
+        chain = [*containers(symbol), *own]
+        if source and not own:
+            start = symbol["range"]["start"]["line"]
+            receiver = go_receiver(source[start]) if start < len(source) else None
+            if receiver:
+                chain.append(receiver)
+        found.append(Declaration(symbol, [*chain, leaf]))
+    return found
+
+
+def parameters_of(symbol: dict) -> str | None:
+    """The parameter list a server reports, whitespace removed: '(string,int)'."""
+    for text in (symbol.get("name") or "", symbol.get("detail") or ""):
+        match = re.search(r"\(([^()]*(?:\([^()]*\)[^()]*)*)\)", text)
+        if match:
+            return "(" + re.sub(r"\s+", "", match.group(1)) + ")"
+    return None
+
+
+def match_declarations(declarations: list[Declaration], path: tuple[str, ...] | list[str],
+                       overload: str | None = None) -> list[Declaration]:
+    """
+    The declarations in one file that `path` (and `overload`) mean.
+
+    Qualifiers match the end of the enclosing chain, so `Server.GetUser` finds
+    `App.Server.GetUser`. A match nested in another match is dropped, so
+    "Record" means the class rather than its constructor of the same name;
+    `Record.Record` means the constructor.
+    """
+    path = list(path)
+    hits = [d for d in declarations if d.chain[-len(path):] == path]
+    hits = [d for d in hits
+            if not any(o is not d and range_contains(o.symbol["range"], d.symbol["range"]) for o in hits)]
+    hits.sort(key=lambda d: (d.symbol["range"]["start"]["line"], d.symbol["range"]["start"]["character"]))
+    if overload and overload.startswith("#"):
+        index = int(overload[1:]) - 1
+        return [hits[index]] if 0 <= index < len(hits) else []
+    if overload:
+        return [d for d in hits if parameters_of(d.symbol) == overload]
+    return hits
+
+
+def address_in_file(declaration: Declaration, declarations: list[Declaration]) -> str:
+    """
+    The shortest name path, plus `#n` for an overload, that means exactly this
+    declaration within its file: what an address puts after "file:".
+    """
+    chain = declaration.chain
+    for length in range(1, len(chain) + 1):
+        path = chain[-length:]
+        hits = match_declarations(declarations, path)
+        if not any(h is declaration for h in hits):
+            continue  # a constructor, hidden behind its class at this length
+        if len(hits) == 1:
+            return ".".join(path)
+        if all(h.chain == chain for h in hits):  # only overloads of itself remain
+            return ".".join(path) + f"#{next(i for i, h in enumerate(hits) if h is declaration) + 1}"
+    return ".".join(chain)
+
+
+def innermost(declarations: list[Declaration], line: int, character: int | None = None) -> Declaration | None:
+    """The deepest declaration whose range contains the 0-based position."""
+    def contains(symbol_range: dict) -> bool:
+        start, end = symbol_range["start"], symbol_range["end"]
+        if not start["line"] <= line <= end["line"]:
+            return False
+        if character is None:
+            return True
+        return ((line, character) >= (start["line"], start["character"])
+                and (line, character) <= (end["line"], end["character"]))
+    inside = [d for d in declarations if contains(d.symbol["range"])]
+    return min(inside, key=lambda d: (d.symbol["range"]["end"]["line"] - d.symbol["range"]["start"]["line"],
+                                      -d.symbol["range"]["start"]["line"]), default=None)
+
+
+class Addresser:
+    """Prints locations as addresses, reading each file's outline once."""
+
+    def __init__(self, session: LanguageServerSession):
+        self.session = session
+        self._outlines: dict[str, list[Declaration]] = {}
+
+    def declarations(self, file: str) -> list[Declaration]:
+        if file not in self._outlines:
+            try:
+                self._outlines[file] = file_declarations(self.session, file)
+            except Exception:  # noqa: BLE001 — an unreadable file prints as a plain location
+                self._outlines[file] = []
+        return self._outlines[file]
+
+    def of(self, file: str, declaration: Declaration) -> str:
+        return f"{file}:{address_in_file(declaration, self.declarations(file))}"
+
+    def at(self, file: str | None, line: int) -> str:
+        """The declaration enclosing a 0-based line, as an address; else file:line."""
+        if not file:
+            return "?"
+        found = innermost(self.declarations(file), line)
+        return self.of(file, found) if found else f"{file}:{line + 1}"
+
+
+@dataclass
+class Target:
+    """What one address resolved to."""
+    session: LanguageServerSession
+    file: str
+    line: int                        # 0-based position that LSP requests use
+    column: int                      # 0-based, UTF-16 units
+    declaration: Declaration | None  # None for a position outside any declaration
+    address: str                     # printable, copyable
+
+    @property
+    def kind(self) -> str:
+        return kind_of(self.declaration.symbol) if self.declaration else "position"
+
+
+def require_declaration(target: Target) -> Declaration:
+    if target.declaration is None:
+        raise ToolError(f"{target.address} is not inside any declaration")
+    return target.declaration
+
+
+RESOLVE_LISTED = 20
+
+
+def source_files_under(pool: LanguageServerPool, where: str) -> list[tuple[str, str]]:
+    """(language, file) for every source file `where` names: a file, a directory or a glob."""
+    if not any(char in where for char in "*?["):
+        # repo_file refuses anything outside the repository and makes an
+        # absolute path inside it relative.
+        where = repo_file(where)
+    elif where.startswith("/") or re.match(r"[A-Za-z]:", where) or ".." in where.split("/"):
+        raise ToolError(f"{where!r} reaches outside the repository ({pool.root}); a pattern "
+                        "must be relative to it")
+    full = pool.root / where
+    if full.is_file():
+        file = repo_file(where)
+        language = pool.language_for_file(file)
+        if language is None:
+            raise ToolError(f"{where!r} is not a file this server handles; it serves "
+                            f"{', '.join(pool.languages)}")
+        return [(language, file)]
+    found = []
+    for language in pool.languages:
+        for absolute in scan_sources(pool.root, language):
+            if is_project_file(absolute, language):
+                continue
+            file = os.path.relpath(absolute, pool.root).replace(os.sep, "/")
+            if (file.startswith(where + "/") if full.is_dir() else fnmatch.fnmatch(file, where)):
+                found.append((language, file))
+    if not found:
+        raise ToolError(f"{where!r} matches no source file of {', '.join(pool.languages)}")
+    return sorted(found, key=lambda pair: pair[1])
+
+
+def files_declaring(session: LanguageServerSession, leaf: str) -> list[str]:
+    """Files that may declare `leaf`: the workspace index's, else those mentioning it."""
+    files = sorted({
+        f for f in (to_relative(h.get("location") or {}) for h in workspace_hits(session, leaf)
+                    if split_symbol_name(h.get("name", ""))[1] == leaf)
+        # The index can name a file that is gone: after a `git mv`, Roslyn
+        # still listed the old path (A/B run c3). Such a file is skipped.
+        if f and (session.root / f).is_file()
+    })
+    # The workspace index is the server's slowest-moving view (sourcekit-lsp
+    # lost NullStore moments after finding it, in CI), and an agent often edits
+    # what it has only just written. A file's outline comes from the file.
+    return files or files_mentioning(session, leaf)
+
+
+def candidate_files(pool: LanguageServerPool, address: Address,
+                    language: str | None = None) -> list[tuple[LanguageServerSession, str]]:
+    if address.where:
+        pairs = source_files_under(pool, address.where)
+        return [(pool.session(lang), f) for lang, f in pairs if language in (None, lang)]
+    sessions = [pool.session(language)] if language else pool.ordered()
+    return [(s, f) for s in sessions for f in files_declaring(s, address.path[-1])]
+
+
+def resolve_all(pool: LanguageServerPool, address: Address, language: str | None = None
+                ) -> list[tuple[LanguageServerSession, str, Declaration, list[Declaration]]]:
+    """Every declaration a (non-position) address matches, in every file it covers."""
+    found = []
+    checked: set[tuple[int, str]] = set()
+    for session, file in candidate_files(pool, address, language):
+        checked.add((id(session), file))
+        declarations = file_declarations(session, file)
+        for declaration in match_declarations(declarations, address.path, address.overload):
+            found.append((session, file, declaration, declarations))
+    if found or address.where:
+        return found
+    # A stale index can name files that no longer declare it, which leaves no
+    # empty answer for files_declaring to fall back from; so fall back here.
+    for session in [pool.session(language)] if language else pool.ordered():
+        for file in files_mentioning(session, address.path[-1]):
+            if (id(session), file) in checked:
+                continue
+            declarations = file_declarations(session, file)
+            for declaration in match_declarations(declarations, address.path, address.overload):
+                found.append((session, file, declaration, declarations))
+    return found
+
+
+def resolve(pool: LanguageServerPool, text: str) -> Target:
+    """The one thing an address means, or a ToolError listing what it could mean."""
+    address = parse_address(text)
+    if address.line is not None:
+        file = repo_file(address.where)
+        language = pool.language_for_file(file)
+        if language is None:
+            raise ToolError(f"{address.where!r} is not a file this server handles; it serves "
+                            f"{', '.join(pool.languages)}")
+        session = pool.session(language)
+        session.sync_with_disk()
+        lines = file_lines(session, file)
+        line = address.line - 1
+        if not 0 <= line < len(lines):
+            raise ToolError(f"{file} has {len(lines)} lines; there is no line {address.line}")
+        declarations = file_declarations(session, file)
+        if address.column is None:
+            found = innermost(declarations, line)
+            if found is None:
+                raise ToolError(f"no declaration contains {file}:{address.line}")
+            start_line, start_char = position_of(found.symbol)
+            return Target(session, file, start_line, start_char, found,
+                          f"{file}:{address_in_file(found, declarations)}")
+        column = utf16_units(lines[line][:address.column - 1])
+        found = innermost(declarations, line, column)
+        return Target(session, file, line, column, found, f"{file}:{address.line}:{address.column}")
+
+    for session in ([pool.session(lang) for lang, _ in source_files_under(pool, address.where)]
+                    if address.where else pool.ordered()):
+        session.sync_with_disk()
+    matches = resolve_all(pool, address)
+    if not matches:
+        scope = f"under {address.where!r}" if address.where else f"in {', '.join(pool.languages)}"
+        raise ToolError(f"No declaration matches {text!r} {scope}. find_symbol with partial=true "
+                        "lists names containing it.")
+    if len(matches) > 1:
+        rows = [f"  {file}:{address_in_file(d, decls)}  {kind_of(d.symbol)} "
+                f"L{d.symbol['range']['start']['line'] + 1}"
+                for _session, file, d, decls in matches[:RESOLVE_LISTED]]
+        more = (f"\n  … and {len(matches) - RESOLVE_LISTED} more. Too broad to act on: narrow it "
+                "with a file or folder, or a qualified name.") if len(matches) > RESOLVE_LISTED else ""
+        raise ToolError(f"{text!r} matches {len(matches)} declarations; use one of these "
+                        f"addresses:\n" + "\n".join(rows) + more)
+    session, file, declaration, declarations = matches[0]
+    line, column = position_of(declaration.symbol)
+    return Target(session, file, line, column, declaration,
+                  f"{file}:{address_in_file(declaration, declarations)}")
+
+
 def file_diagnostics(session: LanguageServerSession, target: str, min_severity: int) -> list[dict]:
     """Diagnostics for one file: pulled where the server supports it, else published."""
     try:
@@ -1883,107 +2007,34 @@ def file_diagnostics(session: LanguageServerSession, target: str, min_severity: 
         ) or []
 
 
-def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
-    if name == "project_info":
-        # Deliberately does not touch session.server: the point is to confirm the
-        # binding before paying for a language server start.
-        started = "running" if session._server is not None else "not started yet"
-        return "\n".join([
-            f"repository    : {session.root}",
-            f"language      : {session.language}",
-            f"language server: {started}",
-            f"cache         : {project_data_dir(session.root)}",
-            f"servers       : {solidlsp_home()}",
-            "",
-            "The repository is the server process's working directory unless a path "
-            "was passed on the command line. One server binds to one repository for "
-            "its lifetime.",
-        ])
-
+def call_tool(session: LanguageServerSession, name: str, args: dict,
+              targets: list[Target] | None = None) -> str:
+    """
+    Answer one tool call. `targets` are the resolved `symbol` addresses, for
+    the tools that take one; file tools and find_symbol are routed elsewhere.
+    """
     # Every question is answered from what is on disk now, not from what was
     # there when the server last looked.
     session.sync_with_disk()
-
-    if name == "find_symbol":
-        query = args["name"]
-        limit = int(args.get("limit", 25))
-        hits = workspace_hits(session, query)
-        if not hits:
-            # Raised, not returned: returned, it was taken as the answer. In
-            # CalibreManager tsserver was asked first and its "none" for the C#
-            # class BookMappingHelper ended the search — 7 of 7 times, across
-            # three runs — while Roslyn, which knew it, was never asked.
-            raise NotFoundHere(f"No symbol matching {query!r}." + sibling_project_caveat(session))
-        # Most-likely-intended first, so the ordering does not depend on Roslyn's.
-        hits = rank_candidates(hits, query)
-        lines = [f"{len(hits)} match(es) for {query!r}:"]
-        lines += [f"  {describe(h)}" for h in hits[:limit]]
-        if len(hits) > limit:
-            lines.append(f"  … and {len(hits) - limit} more")
-        return "\n".join(lines)
-
-    if name == "get_symbols_overview":
-        target = repo_file(args["file"])
-        symbols = symbols_of(session.server.request_document_symbols(target))
-        if not symbols:
-            return f"No symbols in {target} (is it excluded from the project?)."
-        lines = [f"{len(symbols)} symbol(s) in {target}:"]
-        for symbol in symbols:
-            position = position_of(symbol)
-            where = f"L{position[0] + 1}" if position else "?"
-            detail = symbol.get("detail")
-            suffix = f" — {detail}" if detail else ""
-            lines.append(f"  {symbol.get('name')} (kind={symbol.get('kind')}) {where}{suffix}")
-        return "\n".join(lines)
+    target = targets[0] if targets else None
 
     if name == "find_references":
         limit = int(args.get("limit", 50))
-        symbol_name = args["name"]
-
-        if args.get("file") and args.get("line") is not None:
-            target = repo_file(args["file"])
-            line = int(args["line"]) - 1
-            column = 0
-            for symbol in symbols_of(session.server.request_document_symbols(target)):
-                if symbol.get("name") == symbol_name:
-                    found = position_of(symbol)
-                    if found:
-                        line, column = found
-                    break
-            attempts = [(target, line, column, f"{target}:{line + 1}")]
-        else:
-            attempts = []
-            for candidate in candidates_for(session, symbol_name):
-                location = candidate.get("location") or {}
-                path = to_relative(location)
-                position = position_of(candidate)
-                if path and position:
-                    attempts.append((path, position[0], position[1], describe(candidate)))
-            if not attempts:
-                raise ToolError(f"symbol {symbol_name!r} has no usable location")
-
-        # Try each candidate rather than trusting the top-ranked one. A name that
-        # resolves to a constructor or a DI field genuinely has no references of
-        # its own, and reporting that as "no references" invites an agent to
-        # delete something that is very much in use.
-        refs: list = []
-        used = attempts[0]
-        for attempt in attempts:
-            path, line, column, _label = attempt
-            found_refs = session.server.request_references(path, line, column) or []
-            if found_refs:
-                refs, used = found_refs, attempt
-                break
-
+        refs = session.server.request_references(target.file, target.line, target.column) or []
         if not refs:
-            tried = "\n".join(f"  tried {a[3]}" for a in attempts)
             return (
-                f"No references to {symbol_name!r} found from any of its "
-                f"{len(attempts)} declaration(s):\n{tried}\n"
-                "Treat this as inconclusive rather than as proof it is unused."
+                f"No references to {target.address} found. Treat this as inconclusive "
+                "rather than as proof it is unused: reflection, DI and configuration "
+                "are invisible to references."
             )
 
         with_code = args.get("include_code", True)
+        # The reference line alone by default. In the A/B test, 15 references
+        # with six lines of surroundings each came to 7.5K chars — mostly
+        # response headers and catch blocks — carried in every later request.
+        # One reference is different: its surroundings are cheap, and often
+        # the reason for asking.
+        context = int(args.get("context", 3 if len(refs) == 1 else 0))
         by_file: dict[str, list[int]] = {}
         for ref in refs:
             location = ref.get("location") or ref
@@ -1992,70 +2043,46 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             ln = (rng.get("start") or {}).get("line")
             by_file.setdefault(path, []).append(ln if isinstance(ln, int) else 0)
 
-        lines = [
-            f"{len(refs)} reference(s) to {symbol_name!r} in {len(by_file)} file(s) "
-            f"(resolved to {used[3]}):"
-        ]
+        # Each reference under the declaration that contains it, so the answer
+        # says which method uses it, as an address the next call can take.
+        addresser = Addresser(session)
+        lines = [f"{len(refs)} reference(s) to {target.address} in {len(by_file)} file(s):"]
         shown_refs = 0
         for path, line_numbers in sorted(by_file.items())[:limit]:
-            if with_code:
-                lines.append(f"  {path}")
-                for ln in sorted(set(line_numbers)):
-                    if shown_refs >= limit:
-                        break
-                    lines.append(f"    L{ln + 1}:")
-                    lines.append(peek(session, path, ln))
-                    shown_refs += 1
-            else:
+            if not with_code:
                 rendered = ", ".join(f"L{n + 1}" for n in sorted(line_numbers)[:10])
                 more = f" (+{len(line_numbers) - 10} more)" if len(line_numbers) > 10 else ""
                 lines.append(f"  {path} — {rendered}{more}")
-        if len(by_file) > limit:
-            lines.append(f"  … and {len(by_file) - limit} more files")
-        if len(attempts) > 1:
-            others = [a[3] for a in attempts if a is not used]
-            lines.append(f"  (other declarations of this name: {'; '.join(others)})")
-        return "\n".join(lines)
-
-    if name == "find_definition":
-        symbol = resolve_symbol(session, args["name"])
-        location = symbol.get("location") or {}
-        target = to_relative(location)
-        position = position_of(symbol)
-        if not target or not position:
-            raise ToolError(f"symbol {args['name']!r} has no usable location")
-        defs = session.server.request_definition(target, position[0], position[1]) or []
-        if not defs:
-            return f"{symbol.get('name')} — declared at {location_of(symbol)}"
-        lines = [f"{symbol.get('name')} is defined at:"]
-        lines += [f"  {location_of(d)}" for d in defs]
+                continue
+            lines.append(f"  {path}")
+            for ln in sorted(set(line_numbers)):
+                if shown_refs >= limit:
+                    break
+                enclosing = innermost(addresser.declarations(path), ln)
+                within = (address_in_file(enclosing, addresser.declarations(path))
+                          if enclosing else "(top level)")
+                if context:
+                    lines.append(f"    {within} L{ln + 1}:")
+                    lines.append(peek(session, path, ln, context, context))
+                else:
+                    lines.append(f"    {within} L{ln + 1}: {source_line(session, path, ln)}")
+                shown_refs += 1
+        if len(by_file) > limit or shown_refs < len(refs):
+            lines.append(f"  … truncated at {limit}: {len(refs)} references in {len(by_file)} files. "
+                         "Raise limit to see all.")
         return "\n".join(lines)
 
     if name == "get_symbol_body":
-        # Resolved like the edit tools and cut from the declaration's own range,
-        # so the text is exactly what replace_symbol_body replaces. It used to
-        # ask SolidLSP for the symbol containing the workspace-symbol position,
-        # which for a one-line C# member (`public int Scaled(int f) => …;`)
-        # returned the whole enclosing class — and a round trip through
-        # replace_symbol_body then nested the class inside itself.
-        matches = declaration_matches(session, args["name"], args.get("file"), args.get("line"))
-        parts = []
-        if len(matches) > 1:
-            parts.append(
-                f"{len(matches)} declarations match {args['name']!r}. Qualify it "
-                "(Type.member) or pass file and line to pick one."
-            )
-        texts: dict[str, str] = {}
-        for path, symbol, qualified in matches[:5]:
-            if path not in texts:
-                with open(session.root / path, encoding="utf-8", newline="") as handle:
-                    texts[path] = handle.read()
-            start = symbol["range"]["start"]["line"]
-            parts.append(f"{qualified} ({kind_of(symbol)}) — {path}:{start + 1}\n\n"
-                         + range_text(texts[path], symbol["range"]))
-        if len(matches) > 5:
-            parts.append(f"… and {len(matches) - 5} more")
-        return "\n\n".join(parts)
+        # Cut from the declaration's own range, so the text is exactly what
+        # replace_symbol_body replaces. It once asked SolidLSP for the symbol
+        # containing the workspace-symbol position, which for a one-line C#
+        # member (`public int Scaled(int f) => …;`) returned the whole class.
+        declaration = require_declaration(target)
+        with open(session.root / target.file, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+        start = declaration.symbol["range"]["start"]["line"]
+        return (f"{target.address} ({target.kind}, L{start + 1})\n\n"
+                + range_text(text, declaration.symbol["range"]))
 
     if name == "get_file_diagnostics":
         target = repo_file(args["file"])
@@ -2090,10 +2117,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                     f"{target}: the language server reported no {scope}s, but that cannot "
                     f"be trusted here.\n{restore_warning}"
                 )
-            return (
-                f"{target}: no {scope}s or worse. Note this is the language server's view "
-                "of the project, not a full build."
-            )
+            return f"{target}: no {scope}s or worse."
         diagnostics.sort(key=lambda d: (d.get("severity") or 9,
                                         ((d.get("range") or {}).get("start") or {}).get("line") or 0))
         counts = Counter(names.get(d.get("severity"), "?") for d in diagnostics)
@@ -2127,47 +2151,15 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             rendered.append(f"  … and {len(diagnostics) - int(args.get('limit', 40))} more")
         return "\n".join(rendered)
 
-    if name == "explain_symbol":
-        candidate = resolve_symbol(session, args["name"])
-        location = candidate.get("location") or {}
-        target = to_relative(location)
-        position = position_of(candidate)
-        if not target or not position:
-            raise ToolError(f"symbol {args['name']!r} has no usable location")
-        parts = [describe(candidate)]
-
-        hover = session.server.request_hover(target, position[0], position[1])
-        text = ((hover or {}).get("contents") or {})
-        if isinstance(text, dict):
-            text = text.get("value") or ""
-        elif isinstance(text, list):
-            text = "\n".join(t.get("value", str(t)) if isinstance(t, dict) else str(t) for t in text)
-        if text and str(text).strip():
-            parts.append(f"\n{str(text).strip()}")
-
-        try:
-            signature = session.server.request_signature_help(target, position[0], position[1])
-        except Exception:  # noqa: BLE001 — optional extra
-            signature = None
-        for item in ((signature or {}).get("signatures") or [])[:3]:
-            parts.append(f"\nsignature: {item.get('label')}")
-
-        parts.append(f"\ndeclared at:\n{peek(session, target, position[0], 1, 3)}")
-        return "\n".join(parts)
-
     if name == "blast_radius":
         depth = max(1, min(int(args.get("depth", 2)), 4))
         budget = int(args.get("max_queries", 60))
-        root = resolve_symbol(session, args["name"])
-        root_location = root.get("location") or {}
-        root_target = to_relative(root_location)
-        root_position = position_of(root)
-        if not root_target or not root_position:
-            raise ToolError(f"symbol {args['name']!r} has no usable location")
+        root_target, root_position = target.file, (target.line, target.column)
+        addresser = Addresser(session)
 
         seen: set[str] = set()
         queries = 0
-        lines = [f"Blast radius of {describe(root)} (depth {depth}):"]
+        lines = [f"Blast radius of {target.address} (depth {depth}):"]
 
         def expand(file: str, line: int, column: int, level: int, prefix: str) -> None:
             nonlocal queries
@@ -2191,9 +2183,9 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                 if key in seen:
                     continue
                 seen.add(key)
-                lines.append(
-                    f"{prefix}{symbol.get('name')} ({kind_of(symbol)}) — {path}:{reference.line + 1}"
-                )
+                declared = position_of(symbol)
+                where = addresser.at(path, declared[0]) if declared else f"{path}:?"
+                lines.append(f"{prefix}{where}  {kind_of(symbol)}, uses it at L{reference.line + 1}")
                 position = position_of(symbol)
                 if position and level < depth:
                     expand(path, position[0], position[1], level + 1, prefix + "  ")
@@ -2201,7 +2193,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         expand(root_target, root_position[0], root_position[1], 1, "  ")
         if len(lines) == 1:
             return (
-                f"Nothing references {describe(root)} — it is a leaf, or it is reached "
+                f"Nothing references {target.address} — it is a leaf, or it is reached "
                 "only by reflection, DI or configuration, which references cannot see."
             )
         lines.append(f"\n{len(seen)} distinct symbol(s) affected, {queries} query(ies).")
@@ -2210,85 +2202,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         return "\n".join(lines)
 
     if name == "rename_symbol":
-        new_name = args["new_name"]
-        candidate = resolve_symbol(session, args["name"])
-        location = candidate.get("location") or {}
-        target = to_relative(location)
-        position = position_of(candidate)
-        if not target or not position:
-            raise ToolError(f"symbol {args['name']!r} has no usable location")
-
-        edit = session.server.request_rename_symbol_edit(
-            target, position[0], position[1], new_name
-        )
-        steps = edit_steps(edit)
-        if not steps:
-            raise ToolError(
-                f"the language server produced no edits renaming {args['name']!r} to "
-                f"{new_name!r} — it may consider the rename illegal here"
-            )
-
-        total = sum(len(s[2]) for s in steps if s[0] == "edit")
-        files = {s[1] for s in steps if s[0] == "edit"}
-        summary = [
-            f"Rename {describe(candidate)} to {new_name!r}: "
-            f"{total} edit(s) across {len(files)} file(s)."
-        ]
-        summary += describe_steps(steps)
-
-        if not args.get("apply"):
-            summary.append(
-                "\nDry run — nothing written. Re-run with apply=true to perform it. "
-                "Review the file list first: a rename touching unexpected files usually "
-                "means the symbol resolved to something other than what you meant."
-            )
-            return "\n".join(summary)
-
-        applied, unchanged, failed = apply_steps(session.root, steps)
-        # Now rather than at the next call: the server reindexes asynchronously,
-        # and this gives it the time the agent spends reading this answer.
-        session.sync_with_disk()
-
-        # Report what happened on disk, not what was attempted. The previous
-        # implementation announced success unconditionally while writing
-        # nothing, which is the worst possible failure for a tool an agent
-        # trusts enough to skip re-reading the file afterwards.
-        summary.append(f"\nWritten: {applied} file(s).")
-        if unchanged:
-            summary.append(
-                f"{unchanged} file(s) were already identical — no bytes changed."
-            )
-        if failed:
-            summary.append("Failed to write:\n" + "\n".join(failed))
-            raise ToolError("\n".join(summary))
-        if not applied and not unchanged:
-            raise ToolError("\n".join(summary + ["Nothing was written."]))
-
-        # What the rename did not reach. A language server renames the symbol,
-        # not comments or strings, and tsserver could leave `New as Old`
-        # re-exports. In CalibreManager an agent read this tool's success as
-        # "renamed everywhere" and said so, over ten comments and an alias
-        # still naming the old type. So the answer lists what is left.
-        old = split_symbol_name(args["name"])[1] or args["name"]
-        pattern = re.compile(rf"(?<![\w$]){re.escape(old)}(?![\w$])")
-        left = []
-        for relative in files_mentioning(session, old, limit=200):
-            for number, text in enumerate(file_lines(session, relative)):
-                if pattern.search(text):
-                    left.append(f"  {relative}:{number + 1}: {text.strip()[:120]}")
-        if left:
-            summary.append(
-                f"\nNot changed by the rename — {len(left)} line(s) still mention "
-                f"{old!r} (comments, strings, or re-exports under the old name). "
-                "Update them if the rename should cover them:"
-            )
-            summary += left[:15] + ([f"  … and {len(left) - 15} more"] if len(left) > 15 else [])
-        else:
-            summary.append(f"No other mention of {old!r} is left in the source.")
-        summary.append(
-            "Run get_file_diagnostics on an affected file to confirm the project still builds."
-        )
-        return "\n".join(summary)
+        return rename(targets, args)
 
     if name == "find_implementations":
         limit = int(args.get("limit", 50))
@@ -2297,76 +2211,46 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                 f"the {session.language} language server does not support "
                 "textDocument/implementation"
             )
-        # Try each declaration, as find_references does: asking an interface's
-        # constructor for implementations returns nothing, which is not the same
-        # as the interface having none.
-        for candidate in candidates_for(session, args["name"]):
-            location = candidate.get("location") or {}
-            target = to_relative(location)
-            position = position_of(candidate)
-            if not target or not position:
-                continue
-            impls = session.server.request_implementation(target, position[0], position[1]) or []
-            if impls:
-                lines = [
-                    f"{len(impls)} implementation(s) of {args['name']!r} "
-                    f"(resolved to {describe(candidate)}):"
-                ]
-                lines += [f"  {location_of(i)}" for i in impls[:limit]]
-                if len(impls) > limit:
-                    lines.append(f"  … and {len(impls) - limit} more")
-                return "\n".join(lines)
-        return (
-            f"No implementations of {args['name']!r} found. If it is a concrete class "
-            "rather than an interface or virtual member, that is expected."
-        )
+        impls = session.server.request_implementation(target.file, target.line, target.column) or []
+        if not impls:
+            return (
+                f"No implementations of {target.address} found. If it is a concrete class "
+                "rather than an interface or virtual member, that is expected."
+            )
+        addresser = Addresser(session)
+        lines = [f"{len(impls)} implementation(s) of {target.address}:"]
+        for impl in impls[:limit]:
+            location = impl.get("location") or impl
+            start = ((location.get("range") or {}).get("start") or {}).get("line", 0)
+            lines.append(f"  {addresser.at(to_relative(location), start)}")
+        if len(impls) > limit:
+            lines.append(f"  … truncated at {limit} of {len(impls)}. Raise limit to see all.")
+        return "\n".join(lines)
 
     if name == "type_definition":
-        if args.get("file"):
-            # A local variable is not a workspace symbol, so it cannot be found by
-            # name; it has to be pointed at.
-            target = repo_file(args["file"])
-            identifier = args.get("symbol") or ""
-            if args.get("line") is None or not identifier:
-                raise ToolError("with file, give line and symbol too")
-            line = int(args["line"]) - 1
-            lines = file_lines(session, target)
-            if not 0 <= line < len(lines):
-                raise ToolError(f"{target} has no line {line + 1}")
-            match = re.search(rf"(?<![\w$]){re.escape(identifier)}(?![\w$])", lines[line])
-            if not match:
-                raise ToolError(f"{identifier!r} does not appear on {target}:{line + 1}")
-            column = utf16_units(lines[line][:match.start()])
-            attempts = [(target, line, column, f"{identifier} — {target}:{line + 1}")]
-        elif args.get("name"):
-            attempts = declarations(session, args["name"])
-        else:
-            raise ToolError("give name, or file with line and symbol")
-
-        for path, line, column, label in attempts:
-            try:
-                result = lsp_request(session, path, "type_definition",
-                                     position_params(session, path, line, column))
-            except Unsupported:
-                raise ToolError(
-                    f"the {session.language} language server does not support "
-                    "textDocument/typeDefinition"
-                ) from None
-            targets = targets_of(result)
-            if targets:
-                parts = [f"{label} is of type:"]
-                for file, target_line, uri in targets:
-                    if file:
-                        parts.append(f"  {file}:{target_line + 1}")
-                        parts.append(peek(session, file, target_line, 1, 6))
-                    else:
-                        # A library or framework type.
-                        parts.append(f"  {uri} (outside the repository)")
-                return "\n".join(parts)
-        return (
-            f"No type definition for {args.get('symbol') or args.get('name')!r}. It may "
-            "itself be a type, or have a type the server cannot resolve (dynamic code)."
-        )
+        try:
+            result = lsp_request(session, target.file, "type_definition",
+                                 position_params(session, target.file, target.line, target.column))
+        except Unsupported:
+            raise ToolError(
+                f"the {session.language} language server does not support "
+                "textDocument/typeDefinition"
+            ) from None
+        found = targets_of(result)
+        if not found:
+            return (
+                f"No type definition for {target.address}. It may itself be a type, or "
+                "have a type the server cannot resolve (dynamic code)."
+            )
+        addresser = Addresser(session)
+        parts = [f"{target.address} is of type:"]
+        for file, target_line, uri in found:
+            if file:
+                parts.append(f"  {addresser.at(file, target_line)}")
+                parts.append(peek(session, file, target_line, 1, 6))
+            else:
+                parts.append(f"  {uri} (outside the repository)")
+        return "\n".join(parts)
 
     if name == "call_hierarchy":
         direction = args.get("direction") or "incoming"
@@ -2374,7 +2258,8 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             raise ToolError("direction must be incoming or outgoing")
         depth = max(1, min(int(args.get("depth", 1)), 4))
         budget = 60
-        attempts = declarations(session, args["name"])
+        attempts = [(target.file, target.line, target.column, target.address)]
+        addresser = Addresser(session)
 
         def from_references(reason: str) -> str:
             # Incoming calls have an honest substitute: the symbols containing
@@ -2385,7 +2270,7 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             # without a licence had neither calls nor references, and saying
             # "a leaf" there would be a confident false answer.
             text = call_tool(session, "blast_radius",
-                             {"name": args["name"], "depth": depth, "max_queries": budget})
+                             {"depth": depth, "max_queries": budget}, [target])
             if text.startswith("Nothing references"):
                 return (
                     f"{reason} Its references found nothing either. Treat this as "
@@ -2438,6 +2323,8 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             for call in calls:
                 peer = call.get(other_end) or {}
                 peer_file, peer_line, peer_label = hierarchy_item(peer)
+                if peer_file:
+                    peer_label = f"{addresser.at(peer_file, peer_line)}  {kind_of(peer)}"
                 # Incoming call sites are in the caller's file; outgoing ones are
                 # in the file being expanded.
                 site_file = peer_file if direction == "incoming" else item_file
@@ -2467,8 +2354,9 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
         if direction not in ("both", "supertypes", "subtypes"):
             raise ToolError("direction must be both, supertypes or subtypes")
         wanted = ["supertypes", "subtypes"] if direction == "both" else [direction]
-        attempts = declarations(session, args["name"])
+        attempts = [(target.file, target.line, target.column, target.address)]
         path, line, column, label = attempts[0]
+        addresser = Addresser(session)
 
         try:
             items = []
@@ -2492,6 +2380,8 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
                     parts.append("  (none)")
                 for item in found:
                     item_file, item_line, item_label = hierarchy_item(item)
+                    if item_file:
+                        item_label = f"{addresser.at(item_file, item_line)}  {kind_of(item)}"
                     parts.append(f"  {item_label}")
                     code = source_line(session, item_file, item_line)
                     if code:
@@ -2517,10 +2407,9 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
             if not implementations:
                 parts.append("  (none found)")
             for implementation in implementations:
-                where = location_of(implementation)
                 file = to_relative(implementation.get("location") or implementation)
                 start = ((implementation.get("range") or {}).get("start") or {}).get("line", 0)
-                parts.append(f"  {where}")
+                parts.append(f"  {addresser.at(file, start)}")
                 code = source_line(session, file, start)
                 if code:
                     parts.append(f"      {code}")
@@ -2529,11 +2418,89 @@ def call_tool(session: LanguageServerSession, name: str, args: dict) -> str:
     if name == "code_action":
         return code_action(session, args)
 
-    if name in ("replace_symbol_body", "insert_before_symbol", "insert_after_symbol",
-                "safe_delete_symbol"):
-        return edit_symbol(session, name, args)
+    if name == "insert_at_symbol" and args.get("position") not in ("before", "after"):
+        raise ToolError("position must be 'before' or 'after'")
+    if name in ("replace_symbol_body", "insert_at_symbol", "safe_delete_symbol"):
+        return edit_symbol(target, name, args)
 
     raise ToolError(f"unknown tool: {name}")
+
+
+def rename(targets: list[Target], args: dict) -> str:
+    """
+    Rename every addressed symbol to one new name, each through its own
+    language's server, as one change: previewed together, written together.
+    """
+    new_name = args["new_name"]
+    steps: list[tuple] = []
+    summary = []
+    for target in targets:
+        edit = target.session.server.request_rename_symbol_edit(
+            target.file, target.line, target.column, new_name
+        )
+        these = edit_steps(edit)
+        if not these:
+            raise ToolError(
+                f"the language server produced no edits renaming {target.address} to "
+                f"{new_name!r}; it may consider the rename illegal there"
+            )
+        total = sum(len(s[2]) for s in these if s[0] == "edit")
+        files = {s[1] for s in these if s[0] == "edit"}
+        summary.append(f"Rename {target.address} ({target.kind}) to {new_name!r}: "
+                       f"{total} edit(s) across {len(files)} file(s).")
+        summary += describe_steps(these)
+        steps += these
+
+    if not args.get("apply"):
+        summary.append("\nDry run — nothing written. Re-run with apply=true to perform it.")
+        return "\n".join(summary)
+
+    root = targets[0].session.root
+    applied, unchanged, failed = apply_steps(root, steps)
+    # Now rather than at the next call: the server reindexes asynchronously,
+    # and this gives it the time the agent spends reading this answer.
+    for session in {id(t.session): t.session for t in targets}.values():
+        session.sync_with_disk()
+
+    # Report what happened on disk, not what was attempted. An earlier version
+    # announced success while writing nothing, which is the worst failure for
+    # a tool an agent trusts enough to skip re-reading the file afterwards.
+    summary.append(f"\nWritten: {applied} file(s).")
+    if unchanged:
+        summary.append(f"{unchanged} file(s) were already identical — no bytes changed.")
+    if failed:
+        summary.append("Failed to write:\n" + "\n".join(failed))
+        raise ToolError("\n".join(summary))
+    if not applied and not unchanged:
+        raise ToolError("\n".join(summary + ["Nothing was written."]))
+
+    # What the rename did not reach. A language server renames the symbol,
+    # not comments or strings, and tsserver could leave `New as Old`
+    # re-exports. In CalibreManager an agent read this tool's success as
+    # "renamed everywhere" and said so, over ten comments and an alias still
+    # naming the old type. So the answer lists what is left, in the renamed
+    # symbols' own languages.
+    left = []
+    for target in targets:
+        old = target.declaration.chain[-1] if target.declaration else ""
+        if not old or old == new_name:
+            continue
+        pattern = re.compile(rf"(?<![\w$]){re.escape(old)}(?![\w$])")
+        for relative in files_mentioning(target.session, old, limit=200):
+            for number, text in enumerate(file_lines(target.session, relative)):
+                if pattern.search(text):
+                    left.append(f"  {relative}:{number + 1}: {text.strip()[:120]}")
+    if left:
+        summary.append(
+            f"\nNot changed by the rename — {len(left)} line(s) still mention the old name "
+            "(comments, strings, re-exports, or another symbol of that name). Update them "
+            "if the rename should cover them:"
+        )
+        summary += left[:15] + ([f"  … and {len(left) - 15} more"] if len(left) > 15 else [])
+    else:
+        summary.append("No other mention of the old name is left in the source.")
+    summary.append("Run get_file_diagnostics on an affected file to confirm it still compiles.")
+    return "\n".join(summary)
 
 
 def code_action(session: LanguageServerSession, args: dict) -> str:
@@ -2667,89 +2634,6 @@ def files_mentioning(session: LanguageServerSession, word: str, limit: int = 25)
     return found
 
 
-def declaration_matches(session: LanguageServerSession, name: str, file: str | None,
-                        line: int | None) -> list[tuple[str, dict, str]]:
-    """
-    Every declaration `name` can mean, as (file, document symbol, qualified name).
-
-    Resolved through document symbols rather than workspace symbols, because
-    they carry the enclosing types (so `MemoryStore.get` can be told from
-    `NullStore.get`) and the declaration's full range. A match nested inside
-    another match is dropped, so "Record" means the class rather than its
-    constructor of the same name.
-    """
-    path = name_path(name)
-    if not path:
-        raise ToolError("name is required")
-    leaf, qualifiers = path[-1], path[:-1]
-    if file:
-        files = [repo_file(file)]
-    else:
-        files = sorted({
-            p for p in (to_relative(h.get("location") or {})
-                        for h in workspace_hits(session, leaf)
-                        if split_symbol_name(h.get("name", ""))[1] == leaf)
-            if p
-        })
-        if not files:
-            # The workspace index is the server's slowest-moving view: in CI,
-            # sourcekit-lsp found NullStore, then moments later answered the
-            # same search with nothing. And an agent often edits what it has
-            # only just written, before any index has caught up. The outline of
-            # a file comes from the file itself, so fall back to the files that
-            # mention the name and ask their outlines.
-            files = files_mentioning(session, leaf)
-        if not files:
-            raise ToolError(f"no declaration named {leaf!r} found in the project")
-
-    matches = []
-    for candidate_file in files:
-        source = file_lines(session, candidate_file) if session.language == "go" else []
-        for symbol in symbols_of(session.server.request_document_symbols(candidate_file)):
-            own, symbol_leaf, impl_block = split_symbol_name(symbol.get("name", ""))
-            if impl_block or symbol_leaf != leaf or not symbol.get("range"):
-                continue
-            chain = [*containers(symbol), *own]
-            if source and not own:
-                start = symbol["range"]["start"]["line"]
-                receiver = go_receiver(source[start]) if start < len(source) else None
-                if receiver:
-                    chain.append(receiver)
-            if qualifiers and chain[-len(qualifiers):] != qualifiers:
-                continue
-            matches.append((candidate_file, symbol, ".".join([*chain, leaf])))
-    if line is not None:
-        wanted = int(line) - 1
-        matches = [m for m in matches
-                   if m[1]["range"]["start"]["line"] <= wanted <= last_line_of(m[1]["range"])]
-    matches = [m for m in matches
-               if not any(o[0] == m[0] and range_contains(o[1]["range"], m[1]["range"]) for o in matches)]
-    if not matches:
-        where = f" in {files[0]}" if file else ""
-        raise ToolError(f"no declaration matching {name!r}{where}")
-    return matches
-
-
-def edit_target(session: LanguageServerSession, name: str, file: str | None,
-                line: int | None) -> tuple[str, dict, str]:
-    """
-    The one declaration an edit means: (file, document symbol, qualified name).
-
-    Read-only tools may take the likeliest match; an edit may not, because a
-    wrong guess rewrites the wrong code. The fixture already has the trap:
-    `get` is declared in both MemoryStore and NullStore. Anything ambiguous is
-    refused with the candidates listed.
-    """
-    matches = declaration_matches(session, name, file, line)
-    if len(matches) > 1:
-        listed = "\n".join(f"  {q} — {f}:{s['range']['start']['line'] + 1}" for f, s, q in matches)
-        raise ToolError(
-            f"{name!r} matches {len(matches)} declarations, and an edit will not guess:\n{listed}\n"
-            "Qualify the name (Type.member), or pass file and line."
-        )
-    return matches[0]
-
-
 def range_text(text: str, symbol_range: dict) -> str:
     """The exact text an LSP range covers, measured the way apply_edits_to_text measures."""
     marker = "\x00"
@@ -2837,16 +2721,17 @@ def refuse_if_used(session: LanguageServerSession, path: str, symbol: dict,
         raise ToolError("\n".join([reason, *rows, *more]))
 
 
-def edit_symbol(session: LanguageServerSession, tool: str, args: dict) -> str:
-    """replace_symbol_body, insert_before_symbol, insert_after_symbol, safe_delete_symbol."""
-    path, symbol, qualified = edit_target(session, args["name"], args.get("file"), args.get("line"))
+def edit_symbol(target: Target, tool: str, args: dict) -> str:
+    """replace_symbol_body, insert_at_symbol, safe_delete_symbol."""
+    session, path = target.session, target.file
+    symbol, qualified = require_declaration(target).symbol, target.address
     with open(session.root / path, encoding="utf-8", newline="") as handle:
         text = handle.read()
     eol = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines()
     symbol_range = symbol["range"]
     first = leading_block_start(lines, symbol_range["start"]["line"], session.language)
-    where = f"{qualified} — {path}:{symbol_range['start']['line'] + 1}"
+    where = f"{qualified} (L{symbol_range['start']['line'] + 1})"
 
     if tool == "replace_symbol_body":
         # The range starts after the indentation, so only the first line loses
@@ -2854,12 +2739,12 @@ def edit_symbol(session: LanguageServerSession, tool: str, args: dict) -> str:
         body = args["body"].replace("\r\n", "\n").strip("\n").lstrip(" \t")
         edit = {"range": symbol_range, "newText": body.replace("\n", eol)}
         verb = f"Replaced {where}"
-    elif tool == "insert_after_symbol":
+    elif tool == "insert_at_symbol" and args.get("position") == "after":
         last = last_line_of(symbol_range)
         at = {"line": last, "character": utf16_units(lines[last])}
         edit = {"range": {"start": at, "end": at}, "newText": eol + as_block(args["content"], eol)}
         verb = f"Inserted after {where}"
-    elif tool == "insert_before_symbol":
+    elif tool == "insert_at_symbol":
         at = {"line": first, "character": 0}
         edit = {"range": {"start": at, "end": at}, "newText": as_block(args["content"], eol) + eol}
         verb = f"Inserted before {where}"
@@ -2897,78 +2782,258 @@ def send(message: dict) -> None:
     sys.stdout.flush()
 
 
+SYMBOL_TOOLS = {
+    "find_references", "get_symbol_body", "blast_radius", "rename_symbol",
+    "find_implementations", "type_definition", "call_hierarchy", "type_hierarchy",
+    "replace_symbol_body", "insert_at_symbol", "safe_delete_symbol",
+}
+
+
 def dispatch(pool: LanguageServerPool, tool: str, args: dict) -> str:
     """
     Route one tool call to the language server that can answer it.
 
-    Three cases, in order of how much they can be decided up front:
-
-    `project_info` describes the binding itself, so it never touches a server
-    and reports every language rather than one.
-
-    A tool naming a `file` is decided by that file's extension. Guessing is not
-    needed and would be wrong: asking Roslyn about a .ts file produces a
-    confusing error rather than an answer.
-
-    A tool naming a symbol could be answered by any of them, so they are tried
-    in turn and the first real answer wins. Cross-language references do not
-    exist at the language-server level — a C# symbol has no TypeScript
-    references — so the first language that resolves a name is the one that
-    owns it. Trying in order, warm servers first, also means a repository with
-    four languages does not start four servers to answer one question.
+    `project_info` describes the binding and touches no server. A tool taking
+    a `file` (or code_action's `at`) goes to that file's language. A tool
+    taking a `symbol` resolves the address first, which decides the language:
+    an address means exactly one declaration, so there is no trying languages
+    in turn and taking the first answer.
     """
     if tool == "project_info":
         return describe_pool(pool)
+    if tool == "find_symbol":
+        return find_symbol_in(pool, args)
+
+    if tool in SYMBOL_TOOLS:
+        wanted = args.get("symbol")
+        addresses = wanted if isinstance(wanted, list) else [wanted]
+        if len(addresses) > 1 and tool != "rename_symbol":
+            raise ToolError(f"{tool} takes one symbol address")
+        if tool == "insert_at_symbol" and args.get("position") not in ("before", "after"):
+            raise ToolError("position must be 'before' or 'after'")
+        targets = [resolve(pool, address) for address in addresses]
+        return call_tool(targets[0].session, tool, args, targets)
+
+    if tool == "code_action":
+        at = re.fullmatch(r"(.+):(\d+)(?:-(\d+))?", (args.get("at") or "").strip())
+        if not at:
+            raise ToolError("at must be file:line or file:line-line")
+        args = {**args, "file": at.group(1), "line": int(at.group(2)),
+                "end_line": int(at.group(3) or at.group(2))}
 
     target = args.get("file")
-    if target:
-        language = pool.language_for_file(repo_file(target))
-        if language is None:
-            known = ", ".join(pool.languages)
-            raise ToolError(
-                f"{target!r} is not a file this server handles. It serves "
-                f"{known} in {pool.root}. A file of another language needs a "
-                "server bound to that language."
-            )
-        return call_tool(pool.session(language), tool, args)
+    if not target:
+        raise ToolError(f"{tool} needs a file")
+    language = pool.language_for_file(repo_file(target))
+    if language is None:
+        raise ToolError(
+            f"{target!r} is not a file this server handles. It serves "
+            f"{', '.join(pool.languages)} in {pool.root}."
+        )
+    session = pool.session(language)
+    if tool == "code_action":
+        session.sync_with_disk()
+        return code_action(session, args)
+    return call_tool(session, tool, args)
 
-    # Symbol-named tools. Keep the first genuine failure to report if nobody
-    # can answer, rather than the last, which is usually the least relevant
-    # language's complaint.
-    first_error: ToolError | None = None
-    not_found: list[tuple[str, NotFoundHere]] = []
-    for session in pool.ordered():
-        try:
-            return call_tool(session, tool, args)
-        except NotFoundHere as exc:
-            not_found.append((session.language, exc))
-        except ToolError as exc:
-            if first_error is None:
-                first_error = exc
-    # "Not found" is an answer only once every language has given it; then it
-    # is a normal result, not an error, and says which languages were asked.
-    # A real failure in any language outranks it: that one may have known.
-    if first_error is None and not_found:
-        asked = ", ".join(language for language, _ in not_found)
-        details = "\n".join(str(exc) for _, exc in not_found)
-        return f"Not found in any language served here ({asked}).\n{details}"
-    raise first_error or ToolError(f"no language server could answer {tool}")
+
+FIND_LIMIT = 25
+OUTLINE_LIMIT = 200
+
+
+def outline_rows(session: LanguageServerSession, file: str, depth: int | None,
+                 kind: str | None) -> list[str]:
+    """
+    One file's declarations, nested by indentation, each as the part of its
+    address that follows "file:". Namespaces and modules are left out and not
+    counted by depth, and so are a function's locals: tsserver lists every
+    variable in every function body, which is the file, not its outline.
+    """
+    declarations = file_declarations(session, file)
+    rows = []
+    for declaration in declarations:
+        symbol = declaration.symbol
+        if symbol.get("kind") in NAMESPACE_KINDS:
+            continue
+        ancestors, parent = [], symbol.get("parent")
+        while parent:
+            ancestors.append(parent)
+            parent = parent.get("parent")
+        if any(p.get("kind") in CALLABLE_KINDS for p in ancestors):
+            continue
+        level = sum(1 for p in ancestors if p.get("kind") not in NAMESPACE_KINDS)
+        if depth and level >= depth:
+            continue
+        if kind and kind_of(symbol) != kind:
+            continue
+        # Roslyn's detail repeats the name ("Id : int", "Get(string)"): only the
+        # rest of it is shown. Other servers' detail follows the name.
+        leaf, detail = declaration.chain[-1], symbol.get("detail") or ""
+        rest = detail[len(leaf):] if detail.startswith(leaf) else (f" — {detail}" if detail else "")
+        line = symbol["range"]["start"]["line"] + 1
+        rows.append(f"{'  ' * (level + 1)}{address_in_file(declaration, declarations)}{rest}"
+                    f"  {kind_of(symbol)} L{line}")
+    return rows
+
+
+def under(file: str, where: str | None, root: Path) -> bool:
+    if not where:
+        return True
+    if (root / where).is_dir():
+        return file.startswith(where.rstrip("/") + "/")
+    return file == where or fnmatch.fnmatch(file, where)
+
+
+def find_symbol_in(pool: LanguageServerPool, args: dict) -> str:
+    """
+    Declarations by name, file, language and kind, each printed as an address.
+
+    With only `file` (a file, directory or glob) it outlines those files. With
+    a name it lists the declarations of that exact name — servers match
+    substrings, and "BookDto" also returned 17 other classes in the A/B test —
+    counting the rest, which partial=true lists. Every language is asked unless
+    one is given: CalibreManager has a C# BookDto and a TypeScript BookDto, and
+    the agent needs to see both to pick one.
+    """
+    name, where = (args.get("name") or "").strip(), args.get("file")
+    language, kind = args.get("language"), args.get("kind")
+    if language and language not in pool.languages:
+        raise ToolError(f"language {language!r} is not served here; this repository has "
+                        f"{', '.join(pool.languages)}")
+    if where:
+        where = where.replace("\\", "/").strip("/")
+    if not name and not where:
+        raise ToolError("give name, file, or both")
+
+    if not name:
+        limit = int(args.get("limit", OUTLINE_LIMIT))
+        depth = int(args["depth"]) if args.get("depth") else None
+        pairs = [(lang, f) for lang, f in source_files_under(pool, where) if language in (None, lang)]
+        rows, total = [], 0
+        for lang, file in pairs:
+            session = pool.session(lang)
+            session.sync_with_disk()
+            these = outline_rows(session, file, depth, kind)
+            total += len(these)
+            if len(pairs) > 1 and these and len(rows) < limit:
+                rows.append(f"{file}")
+            rows += these[:max(0, limit - len(rows))]
+        if not total:
+            return f"No declarations in {where}" + (f" of kind {kind!r}" if kind else "") + "."
+        head = (f"{total} declaration(s) in {where}" if len(pairs) > 1
+                else f"{total} declaration(s) in {pairs[0][1]}; address each as {pairs[0][1]}:<name>")
+        out = [head + ":", *rows]
+        if sum(1 for r in rows if r.startswith(" ")) < total:
+            out.append(f"… truncated at {limit} of {total}. Too broad to read as a whole: narrow "
+                       "the file pattern, or give depth or kind.")
+        return "\n".join(out)
+
+    limit = int(args.get("limit", FIND_LIMIT))
+    address = parse_address(name if not where else f"{where}:{name}")
+    if address.line is not None:
+        raise ToolError("find_symbol takes a name; for a position, use the tool that acts on it")
+    leaf = address.path[-1]
+    sessions = [pool.session(language)] if language else pool.ordered()
+    for session in sessions:
+        session.sync_with_disk()
+
+    exact = [(file, d, decls) for session, file, d, decls in resolve_all(pool, address, language)
+             if not kind or kind_of(d.symbol) == kind]
+
+    # Names that merely contain it: counted from the workspace index, listed
+    # from the outlines of their files only when asked for or nothing is exact.
+    partial_hits = [
+        (session, to_relative(h.get("location") or {}))
+        for session in sessions for h in workspace_hits(session, leaf)
+        if split_symbol_name(h.get("name", ""))[1] != leaf
+        and leaf.lower() in split_symbol_name(h.get("name", ""))[1].lower()
+        and (not kind or kind_of(h) == kind)
+    ]
+    partial_hits = [(s, f) for s, f in partial_hits if f and under(f, where, pool.root)]
+    listed, label = exact, "named"
+    if args.get("partial") or not exact:
+        label = "named or containing"
+        listed = list(exact)
+        for session, file in sorted({(id(s), f): (s, f) for s, f in partial_hits}.values(),
+                                    key=lambda pair: pair[1]):
+            decls = file_declarations(session, file)
+            listed += [(file, d, decls) for d in decls
+                       if d.chain[-1] != leaf and leaf.lower() in d.chain[-1].lower()
+                       and (not kind or kind_of(d.symbol) == kind)]
+
+    if not listed:
+        caveats = "".join(sibling_project_caveat(s) for s in sessions)
+        asked = ", ".join(s.language for s in sessions)
+        return f"No declaration named {name!r} in {asked}" + (f" under {where}" if where else "") \
+            + "." + caveats
+    rows = [f"  {file}:{address_in_file(d, decls)}  {kind_of(d.symbol)} "
+            f"L{d.symbol['range']['start']['line'] + 1}" for file, d, decls in listed[:limit]]
+    out = [f"{len(listed)} declaration(s) {label} {name!r}:", *rows]
+    if len(listed) > limit:
+        out.append(f"  … truncated at {limit} of {len(listed)}. Too broad to act on as a set: "
+                   "narrow it with file, language, kind or a qualified name.")
+    others = len(partial_hits) if listed is exact else 0
+    if others:
+        out.append(f"  ({others} other name(s) contain {leaf!r}; partial=true lists them)")
+    return "\n".join(out)
 
 
 def describe_pool(pool: LanguageServerPool) -> str:
     """project_info across every language this repository serves."""
     running = pool.started()
     rows = [
-        f"repository    : {pool.root}",
-        f"languages     : {', '.join(pool.languages)}",
-        f"running       : {', '.join(running) if running else 'none started yet'}",
-        f"servers       : {solidlsp_home()}",
-        "",
-        "One server process, one repository, and a language server per language "
-        "it contains. Each starts on the first question that needs it, so a "
-        "language listed but not running has simply not been asked about.",
+        f"repository: {pool.root}",
+        f"languages : {', '.join(pool.languages)}",
+        f"running   : {', '.join(running) if running else 'none started yet'}",
     ]
+    manifests, sources = repository_layout(pool.root, set(pool.languages))
+    if manifests:
+        rows += ["", "project files:"]
+        rows += [f"  {m}" for m in manifests[:LAYOUT_ROWS]]
+        if len(manifests) > LAYOUT_ROWS:
+            rows.append(f"  … and {len(manifests) - LAYOUT_ROWS} more")
+    if sources:
+        rows += ["", "source files by directory:"]
+        for directory, counts in sources[:LAYOUT_ROWS]:
+            rows.append(f"  {directory}/  " + ", ".join(f"{n} {lang}" for lang, n in counts.most_common()))
+        if len(sources) > LAYOUT_ROWS:
+            rows.append(f"  … and {len(sources) - LAYOUT_ROWS} more directories")
     return "\n".join(rows)
+
+
+# What defines a project, by file name or suffix. Listed so an agent can see the
+# shape of the repository without an ls and a cat of package.json.
+MANIFEST_NAMES = {
+    "package.json", "tsconfig.json", "pyproject.toml", "setup.py", "go.mod", "Cargo.toml",
+    "pom.xml", "build.gradle", "build.gradle.kts", "Gemfile", "composer.json",
+    "Package.swift", "CMakeLists.txt",
+}
+MANIFEST_SUFFIXES = (".sln", ".slnx", ".csproj", ".fsproj")
+LAYOUT_ROWS = 25
+
+
+def repository_layout(root: Path, languages: set[str]) -> tuple[list[str], list[tuple[str, Counter]]]:
+    """
+    Project files, and source file counts per directory two levels down.
+
+    Two levels because that is where a repository says what it holds —
+    `backend/Api`, `frontend/src` — and deeper is the file tree an agent can
+    ask for when it needs it.
+    """
+    manifests: list[str] = []
+    by_directory: dict[str, Counter] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(walkable(dirnames))
+        relative = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        parts = [] if relative == "." else relative.split("/")
+        key = "/".join(parts[:2]) or "."
+        for name in sorted(filenames):
+            if name in MANIFEST_NAMES or name.endswith(MANIFEST_SUFFIXES):
+                manifests.append(name if not parts else f"{relative}/{name}")
+            language = EXTENSION_LANGUAGES.get(os.path.splitext(name)[1])
+            if language in languages:
+                by_directory.setdefault(key, Counter())[language] += 1
+    return manifests, sorted(by_directory.items())
 
 
 def serve(pool: LanguageServerPool) -> None:
@@ -3032,39 +3097,43 @@ def serve(pool: LanguageServerPool) -> None:
 def server_instructions() -> str:
     """
     Sent in the initialize response, where MCP clients put it in front of the
-    agent. This is the only place configuration guidance reaches the agent
-    without a human pasting it, so it states what this server is bound to and
-    how to fix a misconfiguration — the two things that otherwise get
-    discovered by a confusing empty answer.
+    agent. This is the only place guidance reaches the agent without a human
+    pasting it, so it carries two things. What this server is bound to, and how
+    to spot a misconfiguration, which otherwise shows up as a confusing empty
+    answer. And when each tool is cheaper than reading or editing files
+    directly, and when it is not: in the A/B test an agent told only "use
+    Lodesman as much as possible" rewrote a 100-line method through
+    replace_symbol_body to add one line. The tool descriptions say what each
+    tool does; the when lives here, in one place.
     """
     root = _ROOT or Path.cwd()
     return (
-        "Lodesman answers questions about code using a real language server, so "
-        "results come from the compiler's understanding rather than a text "
-        f"search. This server is bound to {root} and serves it alone.\n\n"
-        "It serves every language the repository contains, not just the main "
-        "one: the languages are detected at startup and a language server is "
-        "started for each, individually, on the first question that needs it. "
-        "So a .NET solution with a TypeScript frontend is one server entry, not "
-        "two, and questions about either half work without configuration.\n\n"
-        "Call project_info to see which languages this repository was found to "
-        "contain and which of their servers are running. A language listed but "
-        "not running has simply not been asked about yet; the first question "
-        "starts it, which for a cold language server can take a while.\n\n"
-        "Tools naming a file are answered by the server for that file's "
-        "language. Tools naming a symbol are tried against each language in "
-        "turn, so a symbol is found whichever half of the repository it lives "
-        "in.\n\n"
-        "The repository is fixed at startup and no tool changes it. A different "
-        "repository needs another entry in the MCP configuration. Relative "
-        "paths in that entry resolve against the directory the client launches "
-        "in.\n\n"
-        "If a question about code you can see returns nothing, check "
-        "project_info before concluding the symbol is unused: the usual cause "
-        "is that this server is bound to a different directory than you expect. "
-        "Detection covers far more languages than have been verified, so an "
-        "unverified language may answer partially or not at all — that is not "
-        "the same as the symbol being absent, and the difference matters."
+        f"Lodesman answers code questions from real language servers. Bound to {root}, "
+        "it serves every language the repository contains; each language server "
+        "starts on the first question that needs it, so a first call can be slow.\n"
+        "Tools that act on code take a symbol address: Name, Type.member, "
+        "path/File.cs:Name, backend/*:Name (anywhere under a folder), Name#2 (second "
+        "overload), file:42 (the declaration at line 42), file:42:17 (a local or "
+        "parameter at line 42, column 17). An address must mean exactly one "
+        "declaration; if it matches several, the answer lists their addresses. Every "
+        "answer prints addresses you can copy into the next call.\n"
+        "Lodesman is cheaper than reading files when you need one piece of a file, "
+        "and not otherwise:\n"
+        "- project_info shows the languages and projects per directory, without "
+        "starting a server: a quick overview of an unfamiliar repository.\n"
+        "- To see one method or class, get_symbol_body returns just that declaration; "
+        "read the whole file only when you need most of it.\n"
+        "- To see what a file or folder contains, find_symbol with only file is shorter "
+        "than reading it.\n"
+        "- To find where a name is declared or used, find_symbol and find_references "
+        "give the compiler's answer; a text search is fine for strings, comments and markup.\n"
+        "- To rename, rename_symbol changes every reference in one call and lists what it left.\n"
+        "- To edit: replace_symbol_body when you rewrite most of a declaration. For a "
+        "small change inside one, a plain text edit is cheaper: every character you "
+        "send is output you pay for.\n"
+        "- After editing, get_file_diagnostics checks one file without a build.\n"
+        "If an answer is empty for code you can see, check project_info: the server may "
+        "be bound elsewhere, or the language unverified. Empty is then not proof of absence."
     )
 
 

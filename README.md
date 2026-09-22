@@ -97,14 +97,11 @@ agrees with.
 
 | tool | what it answers |
 |---|---|
-| `project_info` | which repository this server bound to, and how |
-| `find_symbol` | find a symbol by name anywhere in the project |
-| `find_definition` | where is this defined |
-| `find_references` | what actually uses this, with the surrounding code |
+| `project_info` | the repository's languages, projects, and where its source files are |
+| `find_symbol` | where a name is declared, in every language; or the outline of a file or folder |
+| `find_references` | what actually uses this, with the line of code and the method it is in |
 | `find_implementations` | concrete implementations of an interface or abstract member |
-| `get_symbols_overview` | outline one file: its types, methods and fields |
-| `get_symbol_body` | the full source of one declaration, by name |
-| `explain_symbol` | resolved type, signature and documentation |
+| `get_symbol_body` | the full source of one declaration, without reading its file |
 | `blast_radius` | what breaks if this symbol changes |
 | `rename_symbol` | rename everywhere, using the compiler's understanding |
 | `get_file_diagnostics` | compiler diagnostics for one file, from the warm server |
@@ -112,9 +109,30 @@ agrees with.
 | `call_hierarchy` | who calls this, or what it calls, to a chosen depth |
 | `type_hierarchy` | what a type inherits and implements, and what derives from it |
 | `code_action` | the server's quick fixes and refactorings — add a missing import, and so on |
-| `replace_symbol_body` | replace one declaration by name, without reading its file |
-| `insert_before_symbol` / `insert_after_symbol` | add code next to a declaration, e.g. a new method |
+| `replace_symbol_body` | replace one declaration, without reading its file |
+| `insert_at_symbol` | add code before or after a declaration, e.g. a new method |
 | `safe_delete_symbol` | delete a declaration, only if nothing uses it |
+
+### Symbol addresses
+
+Every tool that acts on code takes one `symbol`: an address that must mean
+exactly one declaration. Tools print symbols the same way, so an answer can be
+copied into the next call.
+
+| address | means |
+|---|---|
+| `GetUser` | the declaration named GetUser, in any language |
+| `Server.GetUser` | GetUser inside Server |
+| `backend/Server.cs:GetUser` | GetUser in that file |
+| `backend/*:GetUser` | GetUser anywhere under backend/ (a folder or glob) |
+| `Server.GetUser#2` | the second GetUser overload |
+| `Server.GetUser(int)` | the overload taking an int, where the server reports parameters |
+| `backend/Server.cs:42` | the declaration containing line 42 |
+| `backend/Server.cs:42:17` | whatever is at line 42, column 17: a local, a parameter, a call |
+
+An address that matches several declarations is refused, and the refusal lists
+each of them by an address that picks it. `rename_symbol` also takes a list,
+for renaming, say, the backend and frontend halves of one concept together.
 
 `blast_radius` and `get_file_diagnostics` are the two that exist specifically because agents
 edit code they haven't read: one tells you the cost of a change before you make
@@ -311,9 +329,9 @@ Testing help is very welcome.
   `get_file_diagnostics`, see the edit.
 - **Swift: symbol search is intermittently stale.** sourcekit-lsp answers
   project-wide searches from its index store, which sometimes lags edits
-  and sometimes briefly loses a symbol. Tools that take a name fall back to
-  the files' own outlines when the search comes back empty, so they keep
-  working. `find_symbol` does not fall back, so it can miss a symbol.
+  and sometimes briefly loses a symbol. Lookups by name fall back to the
+  outlines of the files that mention the name when the search comes back
+  empty or stale, so they keep working.
 - **PHP without a licence:** intelephense reserves references, rename,
   implementations, type definition, type hierarchy and code actions for
   licensed users. Without `INTELEPHENSE_LICENSE_KEY` these are refused or
@@ -371,7 +389,7 @@ for coverage, but the two conditions are not the same claim.
 lodesman auto-detects, all modelling the same thing — a `Record` type, a `Store`
 interface, two implementations, and a second file that uses them — so the
 assertions are identical across languages and only the syntax differs. Each
-language then gets the same 18-test contract asserted against it:
+language then gets the same 17-test contract asserted against it:
 
 - **Navigation:** find a symbol, outline a file, resolve a definition, find
   cross-file references, return a body, explain a symbol, answer or decline
@@ -395,23 +413,23 @@ What actually passes, measured in CI on every push rather than claimed:
 
 | language | contract | needs |
 |---|---|---|
-| C# | ✅ 18/18 | nothing: Roslyn fetches .NET and itself. `code_action` and restore tests need the .NET SDK |
-| TypeScript / JavaScript | ✅ 18/18 | node, npm |
-| Python | ✅ 18/18 | uv |
-| Go | ✅ 18/18 | go, and `go install golang.org/x/tools/gopls@latest` |
-| Rust | ✅ 18/18 | rustup, and `rustup component add rust-analyzer` |
-| Java | ✅ 18/18 | a JDK |
-| Swift | ⚠️ 17/18 | a Swift toolchain; the package is built first. Symbol search after a disk edit is intermittent (see Known issues) |
-| C / C++ | ⚠️ 16/18 | clangd. Symbol search does not pick up disk edits (see Known issues) |
-| PHP | ⚠️ 15/18 | node, npm: intelephense analyses PHP from node. Three tests need `INTELEPHENSE_LICENSE_KEY`; without one those features are refused, not answered emptily |
-| Ruby | ⚠️ 15/18 | ruby, bundler, and `gem install ruby-lsp` |
+| C# | ✅ 17/17 | nothing: Roslyn fetches .NET and itself. `code_action` and restore tests need the .NET SDK |
+| TypeScript / JavaScript | ✅ 17/17 | node, npm |
+| Python | ✅ 17/17 | uv |
+| Go | ✅ 17/17 | go, and `go install golang.org/x/tools/gopls@latest` |
+| Rust | ✅ 17/17 | rustup, and `rustup component add rust-analyzer` |
+| Java | ✅ 17/17 | a JDK |
+| Swift | ⚠️ 16/17 | a Swift toolchain; the package is built first. Symbol search after a disk edit is intermittent (see Known issues) |
+| C / C++ | ⚠️ 15/17 | clangd. Symbol search does not pick up disk edits (see Known issues) |
+| PHP | ⚠️ 14/17 | node, npm: intelephense analyses PHP from node. Three tests need `INTELEPHENSE_LICENSE_KEY`; without one those features are refused, not answered emptily |
+| Ruby | ⚠️ 14/17 | ruby, bundler, and `gem install ruby-lsp` |
 | Kotlin | ⚠️ blocked | a JDK; SolidLSP downloads its own server |
 
 Each ⚠️ counts the tests actually passed. The rest are recorded, with their
 reasons, as known failures in `tests/integration/languages.py`. A known
 failure is skipped with its reason; any other failure turns the build red.
 
-**Ruby** fails three of the eighteen, all from one gap. `find_references` and
+**Ruby** fails three of the seventeen, all from one gap. `find_references` and
 `rename_symbol` return nothing, and the rename-visibility test needs rename.
 It is not a capability gap: ruby-lsp advertises both `referencesProvider`
 and `renameProvider`. Nor is it timing: raising its internal cross-file wait

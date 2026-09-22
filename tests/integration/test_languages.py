@@ -142,18 +142,15 @@ class LanguageContract:
         self.assertIn("Record", self.call("find_symbol", name="Record"))
 
     def test_get_symbols_overview_outlines_a_file(self):
-        outline = self.call("get_symbols_overview", file=self.spec.outline_file)
+        outline = self.call("find_symbol", file=self.spec.outline_file)
         for symbol in self.spec.outline_symbols:
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, outline)
 
-    def test_find_definition_locates_the_declaration(self):
-        self.assertIn("Record", self.call("find_definition", name="Record"))
-
     def test_find_references_crosses_files(self):
         # The fixture uses Record in both the store file and the service file,
         # so a single-file answer means the project did not fully load.
-        text = self.call("find_references", name="Record")
+        text = self.call("find_references", symbol="Record")
         if not self.spec.supports_references:
             # Where the server cannot answer, the requirement inverts: lodesman
             # must not present an empty result as proof of no usage.
@@ -162,16 +159,21 @@ class LanguageContract:
         self.assertNotIn("no references", text.lower())
 
     def test_get_symbol_body_returns_source(self):
-        self.assertIn("Record", self.call("get_symbol_body", name="Record"))
+        self.assertIn("Record", self.call("get_symbol_body", symbol="Record"))
 
-    def test_explain_symbol_describes_it(self):
-        self.assertTrue(self.call("explain_symbol", name="Record").strip())
+    def test_find_symbol_lists_exact_names_only(self):
+        # Servers match substrings, so "Store" also finds MemoryStore and
+        # NullStore. Those are not the answer; they are counted, not listed.
+        text = self.call("find_symbol", name="Store")
+        self.assertIn("declaration(s) named 'Store'", text)
+        self.assertNotIn("MemoryStore", text)
+        self.assertIn("MemoryStore", self.call("find_symbol", name="Store", partial=True))
 
     def test_find_implementations_answers_or_says_it_cannot(self):
         # Two implementations of Store exist in every fixture. A server that
         # does not serve textDocument/implementation must say so — what is not
         # acceptable is a confident empty answer.
-        text, is_error = self.server.call("find_implementations", {"name": "Store"})
+        text, is_error = self.server.call("find_implementations", {"symbol": "Store"})
         if is_error:
             self.assertIn("does not support", text)
         else:
@@ -190,21 +192,20 @@ class LanguageContract:
         # without a call hierarchy must still answer incoming calls, from the
         # reference machinery, and say that they did.
         method = self.locate(r"\b((?i:scaled))\s*\(")[2]
-        text = self.call("call_hierarchy", name=method)
+        text = self.call("call_hierarchy", symbol=method)
         if not self.spec.supports_references and "inconclusive" in text:
             return  # no calls and no references to fall back on: declared, not denied
         self.assertIn("total", text.lower())
 
     def test_type_hierarchy_finds_both_implementations(self):
-        text = self.call("type_hierarchy", name="Store", direction="subtypes")
+        text = self.call("type_hierarchy", symbol="Store", direction="subtypes")
         if "unavailable" in text:
             return  # declared, which is what a server with neither method owes us
         self.assertIn("MemoryStore", text)
         self.assertIn("NullStore", text)
 
     def test_type_definition_resolves_a_local(self):
-        # Pointed at by file and line, because a local is not a workspace
-        # symbol. Most fixtures have `record` in `record.scaled(2)` (`->` in
+        # Pointed at by file:line:column, because a local is in no outline. Most fixtures have `record` in `record.scaled(2)` (`->` in
         # C++, `$record` in PHP); Swift and Kotlin pass closure parameters
         # instead, so their `store` field stands in, whose type is Store.
         try:
@@ -212,9 +213,8 @@ class LanguageContract:
         except LookupError:
             target, expected = self.locate(r"(?<![\w$])(store)\s*(?:\.|\?\.|->)\s*(?i:get)\b"), "Store"
         file, line, identifier = target
-        text, is_error = self.server.call(
-            "type_definition", {"file": file, "line": line, "symbol": identifier}
-        )
+        column = self.spec.files[file].splitlines()[line - 1].index(identifier) + 1
+        text, is_error = self.server.call("type_definition", {"symbol": f"{file}:{line}:{column}"})
         if is_error:
             # A server without typeDefinition must say so, not answer emptily.
             self.assertIn("does not support", text)
@@ -245,15 +245,15 @@ class LanguageContract:
         # round trip nested the class inside itself.
         repo, server = self.fresh_server()
         method = self.scaled_method()
-        text, is_error = server.call("get_symbol_body", {"name": method})
+        text, is_error = server.call("get_symbol_body", {"symbol": method})
         self.assertFalse(is_error, text)
         header, body = text.split("\n\n", 1)
-        file = re.search(r" — (\S+):\d+$", header).group(1)
+        file = header.split(":", 1)[0]  # the header is the address: file:Record.scaled
         self.assertIn("factor", body)
         before = self.error_count(server, file)
 
         text, is_error = server.call(
-            "replace_symbol_body", {"name": method, "body": body.replace("factor", "multiplier")}
+            "replace_symbol_body", {"symbol": method, "body": body.replace("factor", "multiplier")}
         )
         self.assertFalse(is_error, text)
         written = (repo / file).read_text(encoding="utf-8")
@@ -264,22 +264,25 @@ class LanguageContract:
 
     def test_edits_refuse_an_ambiguous_name(self):
         # `get` is declared by Store, MemoryStore and NullStore alike: an edit
-        # that picked one would rewrite whichever came first.
+        # that picked one would rewrite whichever came first. The refusal lists
+        # each by an address that would pick it.
         method = self.locate(r"\b((?i:get))\s*\(")[2]
         before = self.snapshot(self.repo)
-        text, is_error = self.server.call("replace_symbol_body", {"name": method, "body": "x"})
+        text, is_error = self.server.call("replace_symbol_body", {"symbol": method, "body": "x"})
         self.assertTrue(is_error, text)
-        self.assertIn("will not guess", text)
+        self.assertIn("declarations; use one of these addresses", text)
+        self.assertIn("MemoryStore", text)
         self.assertEqual(self.snapshot(self.repo), before)
 
     def test_inserts_land_next_to_the_symbol(self):
         repo, server = self.fresh_server()
         marker = self.COMMENT.get(self.spec.language, "//")
         text, is_error = server.call(
-            "insert_before_symbol", {"name": "NullStore", "content": f"{marker} before-marker"}
+            "insert_at_symbol",
+            {"symbol": "NullStore", "position": "before", "content": f"{marker} before-marker"},
         )
         self.assertFalse(is_error, text)
-        file = re.search(r"— (\S+):\d+\.", text).group(1)
+        file = re.search(r"before (\S+?):", text).group(1)
         lines = (repo / file).read_text(encoding="utf-8").splitlines()
         at = next(i for i, line in enumerate(lines) if "before-marker" in line)
         # Directly above the declaration — or above its attributes, which
@@ -291,7 +294,8 @@ class LanguageContract:
 
         method = self.scaled_method()
         text, is_error = server.call(
-            "insert_after_symbol", {"name": method, "content": f"    {marker} after-marker"}
+            "insert_at_symbol",
+            {"symbol": method, "position": "after", "content": f"    {marker} after-marker"},
         )
         self.assertFalse(is_error, text)
         self.assertIn("after-marker", text)  # the diff shows it
@@ -299,7 +303,7 @@ class LanguageContract:
 
     def test_safe_delete_refuses_a_used_symbol(self):
         before = self.snapshot(self.repo)
-        text, is_error = self.server.call("safe_delete_symbol", {"name": "Record"})
+        text, is_error = self.server.call("safe_delete_symbol", {"symbol": "Record"})
         self.assertTrue(is_error, text)
         self.assertIn("Not deleted", text)
         self.assertEqual(self.snapshot(self.repo), before)
@@ -309,7 +313,7 @@ class LanguageContract:
         # property is about the decision, not the outcome: a refusal must point
         # at real mentions, and a deletion must leave none behind.
         repo, server = self.fresh_server()
-        text, is_error = server.call("safe_delete_symbol", {"name": "NullStore"})
+        text, is_error = server.call("safe_delete_symbol", {"symbol": "NullStore"})
         if is_error:
             self.assertIn("Not deleted", text)
             self.assertIn("NullStore", text.split(":", 1)[1])
@@ -327,7 +331,7 @@ class LanguageContract:
 
         text, is_error = server.call(
             "rename_symbol",
-            {"name": "NullStore", "new_name": "VoidStore", "apply": True},
+            {"symbol": "NullStore", "new_name": "VoidStore", "apply": True},
         )
 
         if not self.spec.supports_rename:
@@ -376,7 +380,7 @@ class LanguageContract:
         deadline = time.time() + timeout
         while True:
             text, is_error = server.call("find_symbol", {"name": name})
-            if not is_error and f"No symbol matching {name!r}" not in text:
+            if not is_error and f"No declaration named {name!r}" not in text:
                 return True
             if time.time() >= deadline:
                 return False
@@ -410,7 +414,7 @@ class LanguageContract:
         _repo, server = self.fresh_server()
         text, is_error = server.call(
             "rename_symbol",
-            {"name": "NullStore", "new_name": "VoidStore", "apply": True},
+            {"symbol": "NullStore", "new_name": "VoidStore", "apply": True},
         )
         self.assertFalse(is_error, text)
         self.assertTrue(self.resolves(server, "VoidStore"),

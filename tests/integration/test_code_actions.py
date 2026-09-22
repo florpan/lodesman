@@ -65,8 +65,8 @@ class MissingImportCase:
     def prepare(self) -> None:
         pass
 
-    def call(self, **arguments) -> str:
-        text, is_error = self.server.call("code_action", {"file": self.file, **arguments})
+    def call(self, line: int, **arguments) -> str:
+        text, is_error = self.server.call("code_action", {"at": f"{self.file}:{line}", **arguments})
         self.assertFalse(is_error, text)
         return text
 
@@ -91,7 +91,7 @@ class MissingImportCase:
 
     def test_an_ambiguous_or_unknown_title_is_refused(self):
         text, is_error = self.server.call(
-            "code_action", {"file": self.file, "line": self.line, "title": "no such action"}
+            "code_action", {"at": f"{self.file}:{self.line}", "title": "no such action"}
         )
         self.assertTrue(is_error)
         self.assertIn("match", text)

@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-09-22
+
+**Breaking: every tool that acts on code now takes a `symbol` address instead
+of `name`, `file` and `line`.** A bare name was an ambiguous pointer. In the
+A/B test, `get_symbol_body(BookDto)` returned the TypeScript interface when
+the agent wanted the C# class, and `rename_symbol` could not be aimed at only
+the TypeScript `BookUpdateDto`, so the agent renamed it with sed instead.
+
+- **Addresses:** `Name`, `Type.member`, `file:Name`, `folder/*:Name`, `Name#2`
+  for an overload, `Name(int)` by parameters, `file:42` for the declaration at
+  a line, `file:42:17` for anything at a position, such as a local. See the
+  README.
+- **An address means exactly one declaration, or the call fails** and lists
+  the candidates, each by an address that picks it. No tool picks "the most
+  likely" match any more, read-only ones included.
+- **Every answer prints addresses:** find results, references (under the
+  method they are in), implementations, hierarchies, blast radius. The next
+  call can copy them.
+- **`get_symbols_overview` is merged into `find_symbol`:** give only `file`
+  (a file, folder or glob) for an outline. Its `depth` now counts from inside
+  namespaces, so `depth=1` in a C# file lists the classes, not just the
+  namespace.
+- **`rename_symbol` takes one address or a list**, with one `new_name`.
+- **`type_definition` takes an address;** a local is `file:line:column`.
+- **`code_action` takes `at`:** `file:line` or `file:line-line`.
+- **A truncated list says so,** and names how to narrow it. A limit only
+  limits what is shown; it never decides what an action touches.
 
 Three fixes found by an A/B test of Claude Code with and without Lodesman on
 a real repository: CalibreManager, with a C# backend and a React-TS frontend.
@@ -20,7 +46,44 @@ a real repository: CalibreManager, with a C# backend and a React-TS frontend.
   an agent took the tool's success report as "renamed everywhere" and told
   the user so, while ten comments and an alias still named the old type.
 
-These fixes are not yet verified by a test run.
+None of the existing tests fail with these fixes in place, locally or in CI.
+No test yet covers the fixes themselves.
+
+Smaller tool definitions, and fewer tools. The definitions travel with every
+request an agent makes, and the A/B test put them at about 4.6K tokens.
+
+- **Descriptions trimmed** to what an agent needs to choose and call a tool:
+  the tool list is 42% smaller and the server instructions 71% smaller.
+- **`find_definition` removed.** It answered with the same location as
+  `find_symbol`.
+- **`explain_symbol` removed.** Its declaration line and hover text are
+  what `get_symbol_body` and `find_symbol` already give.
+- **`find_symbol` lists exact names, from every language.** Servers match
+  substrings: "BookDto" also returned 17 other classes, and only from the
+  first language that answered, so the TypeScript `BookDto` was never shown.
+  Now every language is asked (or the one given as `language`), exact names
+  are listed, and the rest are counted; `partial=true` lists them too. With
+  no exact name, the partial matches are the answer.
+- **`find_references` shows each reference's own line.** Six lines of
+  surroundings per reference made 15 references 7.5K characters, mostly
+  unrelated code, carried in every later request of the session. A single
+  reference still gets three lines either side; `context` asks for more.
+- **`insert_before_symbol` and `insert_after_symbol` are now
+  `insert_at_symbol`**, with `position: before | after`.
+- Fixed explanatory paragraphs dropped from `project_info` and from
+  `get_file_diagnostics`'s "no errors" answer.
+- **`project_info` now gives an orientation.** It lists the repository's
+  project files and its source files per directory, still without starting a
+  language server. Every A/B run began with `ls`, `cat package.json` and
+  similar.
+- **`get_symbols_overview` is shorter.** It shows nesting by indentation and
+  kind names instead of numbers, prints a name once where the server's detail
+  repeats it, and leaves out a function's local variables. A new `depth`
+  parameter limits it to the top levels.
+- **A name lookup no longer fails on a file that has been moved.** After a
+  `git mv`, Roslyn's index still named the old path, and `get_symbol_body`
+  raised `FileNotFoundError`. Files that are gone are now skipped, and the
+  lookup falls back to searching the files themselves.
 
 ## 0.5.0 — 2026-09-21
 

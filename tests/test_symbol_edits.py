@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """
-The text arithmetic behind replace_symbol_body, insert_before_symbol,
-insert_after_symbol and safe_delete_symbol.
+The text arithmetic behind replace_symbol_body, insert_at_symbol and
+safe_delete_symbol.
 
 Every helper here decides which bytes an edit touches, and each one was
 written against a failure seen with a real server: a C# one-line member whose
@@ -154,11 +154,27 @@ class TestIndexFallback(unittest.TestCase):
     of each file that mentions the name, which comes from the file itself.
     """
 
+    def fake(self, root):
+        from types import SimpleNamespace
+
+        outline = [{"name": "NullStore", "kind": 5, "parent": None,
+                    "range": span(0, 0, 1, 8), "selectionRange": span(0, 6, 0, 15)}]
+        asked: list[str] = []
+
+        def document_symbols(path: str):
+            asked.append(path)
+            return outline if path == "store.py" else []
+
+        session = SimpleNamespace(
+            root=root, language="python", sync_with_disk=lambda: 0,
+            server=SimpleNamespace(request_document_symbols=document_symbols),
+        )
+        return session, asked
+
     def test_a_declaration_is_found_when_workspace_search_is_empty(self):
         import tempfile
         import unittest.mock
         from pathlib import Path
-        from types import SimpleNamespace
 
         from lodesman import server
 
@@ -166,27 +182,20 @@ class TestIndexFallback(unittest.TestCase):
             root = Path(tmp).resolve()
             (root / "store.py").write_text("class NullStore:\n    pass\n", encoding="utf-8")
             (root / "other.py").write_text("x = 1\n", encoding="utf-8")
-            outline = [{"name": "NullStore", "kind": 5, "parent": None,
-                        "range": span(0, 0, 1, 8), "selectionRange": span(0, 6, 0, 15)}]
-            asked: list[str] = []
-
-            def document_symbols(path: str):
-                asked.append(path)
-                return outline if path == "store.py" else []
-
-            session = SimpleNamespace(
-                root=root, language="python",
-                server=SimpleNamespace(request_document_symbols=document_symbols),
-            )
+            session, asked = self.fake(root)
             with unittest.mock.patch.object(server, "workspace_hits", return_value=[]):
-                matches = server.declaration_matches(session, "NullStore", None, None)
+                files = server.files_declaring(session, "NullStore")
+                matches = server.match_declarations(server.file_declarations(session, files[0]),
+                                                    ["NullStore"])
 
-        self.assertEqual([(m[0], m[2]) for m in matches], [("store.py", "NullStore")])
-        self.assertEqual(asked, ["store.py"], "only files mentioning the name are outlined")
+        self.assertEqual(files, ["store.py"], "only files mentioning the name are outlined")
+        self.assertEqual([m.chain for m in matches], [["NullStore"]])
+        self.assertEqual(asked, ["store.py"])
 
-    def test_every_name_based_tool_gets_the_fallback(self):
-        # rename_symbol, find_references and the rest start at candidates_for;
-        # the rename test failed in CI exactly as safe_delete had.
+    def test_every_symbol_tool_gets_the_fallback(self):
+        # Every tool taking a symbol resolves it through resolve(); the rename
+        # test failed in CI exactly as safe_delete had, when each tool had its
+        # own lookup.
         import tempfile
         import unittest.mock
         from pathlib import Path
@@ -197,24 +206,15 @@ class TestIndexFallback(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="lodesman-fallback-") as tmp:
             root = Path(tmp).resolve()
             (root / "store.py").write_text("class NullStore:\n    pass\n", encoding="utf-8")
-            outline = [{"name": "NullStore", "kind": 5, "parent": None,
-                        "range": span(0, 0, 1, 8), "selectionRange": span(0, 6, 0, 15)}]
-            session = SimpleNamespace(
-                root=root, language="python",
-                server=SimpleNamespace(
-                    request_document_symbols=lambda path: outline if path == "store.py" else [],
-                    _resolve_file_uri=lambda path: (root / path).as_uri(),
-                ),
-            )
-            with unittest.mock.patch.object(server, "workspace_hits", return_value=[]), \
-                    unittest.mock.patch.object(server, "_ROOT", root):
-                candidates = server.candidates_for(session, "NullStore")
-                where = server.to_relative(candidates[0]["location"])
+            session, _asked = self.fake(root)
+            pool = SimpleNamespace(root=root, languages=["python"], ordered=lambda: [session],
+                                   session=lambda language: session)
+            with unittest.mock.patch.object(server, "workspace_hits", return_value=[]):
+                target = server.resolve(pool, "NullStore")
 
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(where, "store.py")
+        self.assertEqual((target.file, target.address), ("store.py", "store.py:NullStore"))
         # The position tools act on is the name, not the start of the class.
-        self.assertEqual(server.position_of(candidates[0]), (0, 6))
+        self.assertEqual((target.line, target.column), (0, 6))
 
 
 if __name__ == "__main__":
